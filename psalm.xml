@@ -1,0 +1,131 @@
+<?xml version="1.0"?>
+<psalm errorLevel="1" resolveFromConfigFile="true"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xmlns="https://getpsalm.org/schema/config" xsi:schemaLocation="https://getpsalm.org/schema/config vendor/vimeo/psalm/config.xsd" findUnusedBaselineEntry="true" findUnusedCode="true" phpVersion="8.1">
+    <projectFiles>
+        <directory name="src" />
+        <directory name="tests" />
+        <ignoreFiles>
+            <directory name="vendor" />
+        </ignoreFiles>
+    </projectFiles>
+
+    <issueHandlers>
+        <ImplicitToStringCast>
+            <errorLevel type="suppress">
+                <!--
+                    attrecord's DbSession contract types query params as `scalar|BinaryParam|null`
+                    (BinaryParam is its PostgreSQL bytea/LOB wrapper, and is Stringable). This store is
+                    MySQL/MariaDB-only, and attrecord's dialect-gating never wraps binary as a LOB on
+                    MySQL — so a BinaryParam is never instantiated at runtime here. The coercion the
+                    session bind methods report is a statically-reachable-but-runtime-impossible false
+                    positive.
+                -->
+                <directory name="src/Session" />
+                <directory name="tests" />
+            </errorLevel>
+        </ImplicitToStringCast>
+        <PossiblyUnusedProperty>
+            <errorLevel type="suppress">
+                <!-- Record subclass properties are accessed via attrecord reflection, not direct PHP references -->
+                <directory name="src/Worksheet" />
+            </errorLevel>
+        </PossiblyUnusedProperty>
+        <UnusedClass>
+            <errorLevel type="suppress">
+                <directory name="tests" />
+            </errorLevel>
+        </UnusedClass>
+        <PossiblyUndefinedArrayOffset>
+            <errorLevel type="suppress">
+                <directory name="tests" />
+            </errorLevel>
+        </PossiblyUndefinedArrayOffset>
+    <!--
+        <UnusedClass>
+            <errorLevel type="suppress">
+                <directory name="tests" />
+            </errorLevel>
+        </UnusedClass>
+        <UnusedClosureParam>
+            <errorLevel type="suppress">
+                <directory name="tests" />
+            </errorLevel>
+        </UnusedClosureParam>
+        <MissingOverrideAttribute>
+            <errorLevel type="suppress">
+                <directory name="tests" />
+            </errorLevel>
+        </MissingOverrideAttribute>
+        <InternalClass>
+            <errorLevel type="suppress">
+                <directory name="tests" />
+            </errorLevel>
+        </InternalClass>
+        <InternalMethod>
+            <errorLevel type="suppress">
+                <directory name="tests" />
+            </errorLevel>
+        </InternalMethod>
+        <InternalProperty>
+            <errorLevel type="suppress">
+                <directory name="tests" />
+            </errorLevel>
+        </InternalProperty>
+        <MixedArgument>
+            <errorLevel type="suppress">
+                <directory name="tests" />
+            </errorLevel>
+        </MixedArgument>
+        <MixedArrayAccess>
+            <errorLevel type="suppress">
+                <directory name="tests" />
+            </errorLevel>
+        </MixedArrayAccess>
+        <MixedArrayAssignment>
+            <errorLevel type="suppress">
+                <directory name="tests" />
+            </errorLevel>
+        </MixedArrayAssignment>
+        <MixedAssignment>
+            <errorLevel type="suppress">
+                <directory name="tests" />
+            </errorLevel>
+        </MixedAssignment>
+        <MixedMethodCall>
+            <errorLevel type="suppress">
+                <directory name="tests" />
+            </errorLevel>
+        </MixedMethodCall>
+        <MixedOperand>
+            <errorLevel type="suppress">
+                <directory name="tests" />
+            </errorLevel>
+        </MixedOperand>
+        <MixedPropertyFetch>
+            <errorLevel type="suppress">
+                <directory name="tests" />
+            </errorLevel>
+        </MixedPropertyFetch>
+        <MixedReturnStatement>
+            <errorLevel type="suppress">
+                <directory name="tests" />
+            </errorLevel>
+        </MixedReturnStatement>
+        <PossiblyUnusedMethod>
+            <errorLevel type="suppress">
+                <directory name="tests" />
+            </errorLevel>
+        </PossiblyUnusedMethod>
+        <PossiblyUnusedProperty>
+            <errorLevel type="suppress">
+                <directory name="tests" />
+            </errorLevel>
+        </PossiblyUnusedProperty>
+        <UnusedParam>
+            <errorLevel type="suppress">
+                <directory name="tests" />
+            </errorLevel>
+        </UnusedParam> -->
+    </issueHandlers>
+</psalm>

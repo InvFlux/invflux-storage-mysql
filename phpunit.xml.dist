@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<phpunit bootstrap="tests/bootstrap.php" colors="true" failOnDeprecation="true" stopOnFailure="false" failOnWarning="true" failOnRisky="true" testdox="true" cacheDirectory=".phpunit.cache" executionOrder="depends,defects" requireCoverageMetadata="false" beStrictAboutCoverageMetadata="true" beStrictAboutOutputDuringTests="true" displayDetailsOnPhpunitDeprecations="true" failOnPhpunitDeprecation="true">
+  <php>
+    <server name="COLLISION_TESTING" value="1"/>
+  </php>
+  <testsuites>
+    <testsuite name="Default">
+      <directory>tests</directory>
+    </testsuite>
+  </testsuites>
+  <coverage includeUncoveredFiles="true" disableCodeCoverageIgnore="true"/>
+  <source restrictNotices="true" restrictWarnings="true">
+    <include>
+      <directory>src</directory>
+    </include>
+  </source>
+</phpunit>

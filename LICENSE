@@ -1,0 +1,19 @@
+InvFlux MySQL Storage
+Copyright (c) 2026 Samuel de Rougemont
+
+InvFlux MySQL Storage is dual-licensed.
+
+You may use this software under either:
+
+1. The GNU General Public License, version 2 or any later version
+   See [LICENSE-GPL-2.0-or-later](LICENSE-GPL-2.0-or-later)
+
+2. The InvFlux commercial license
+   See [LICENSE-InvFlux-Commercial](LICENSE-InvFlux-Commercial)
+
+If you are distributing derivative works as open-source software under GPL-compatible terms,
+use the GPL option.
+
+If you want to use InvFlux MySQL Storage in a proprietary, closed-source, or otherwise
+non-GPL-compatible product or service, you must obtain a commercial license from the
+copyright holder.

@@ -1,0 +1,99 @@
+name: CI
+
+# PUBLISH GATE — runs on the public mirror (InvFlux/invflux-storage-mysql), not here.
+# Inert in the working repo: Actions only reads .github/workflows/*.yml, never
+# subdirectories. bin/publish-package.sh promotes this directory into .github/workflows/
+# as the snapshot is staged.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mirror-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    name: Sanitized snapshot builds, tests, type-checks
+    runs-on: ubuntu-latest
+
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: invflux_test
+        ports: ['3306:3306']
+
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: invflux-storage-mysql }
+
+      # The sibling MIRROR, not the working repo — the point is that the published trees
+      # work against each other. While the mirrors are still private the token is needed;
+      # once they go public it falls back to the ambient GITHUB_TOKEN and keeps working.
+      - uses: actions/checkout@v4
+        with:
+          repository: InvFlux/invflux-core
+          path: invflux-core
+          token: ${{ secrets.SIBLING_REPOS_TOKEN || github.token }}
+          fetch-depth: 0
+      - uses: actions/checkout@v4
+        with: { repository: Nandan108/attrecord, path: attrecord, fetch-depth: 0 }
+      - uses: actions/checkout@v4
+        with: { repository: Nandan108/slot-flow, path: slot-flow, fetch-depth: 0 }
+      - uses: actions/checkout@v4
+        with: { repository: Nandan108/attrecord-migrations, path: attrecord-migrations, fetch-depth: 0 }
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          extensions: pdo, pdo_mysql, mysqli, mbstring, json
+          coverage: none
+
+      # composer.local.json is NOT usable here: the merge plugin that reads it is a dev
+      # dependency, absent on a fresh checkout, so the merge silently no-ops and composer
+      # resolves published releases instead of the working tree. See .github/ci-siblings.php.
+      - name: Resolve siblings from the checked-out tree
+        working-directory: invflux-storage-mysql
+        run: php .github/ci-siblings.php '{"nandan108/invflux-core":"../invflux-core","nandan108/attrecord":"../attrecord","nandan108/attrecord-migrations":"../attrecord-migrations","nandan108/slot-flow":"../slot-flow"}'
+
+      - name: Install
+        working-directory: invflux-storage-mysql
+        run: composer update --prefer-dist --no-progress --no-interaction
+
+      - name: Wait for MySQL
+        run: |
+          php -r '
+            $deadline = time() + 90;
+            while (true) {
+              try { new PDO("mysql:host=127.0.0.1;port=3306", "root", "root"); echo "MySQL ready\n"; exit(0); }
+              catch (\Throwable $e) {
+                if (time() >= $deadline) { fwrite(STDERR, "MySQL not ready: {$e->getMessage()}\n"); exit(1); }
+                usleep(500000);
+              }
+            }
+          '
+
+      - name: PHP CS Fixer (dry run)
+        working-directory: invflux-storage-mysql
+        run: composer cs-fix -- --dry-run --diff
+
+      - name: Psalm
+        working-directory: invflux-storage-mysql
+        run: composer psalm
+
+      - name: Tests
+        working-directory: invflux-storage-mysql
+        env:
+          INVFLOW_DB_HOST: 127.0.0.1
+          INVFLOW_DB_PORT: '3306'
+          INVFLOW_DB_NAME: invflux_test
+          INVFLOW_DB_USER: root
+          INVFLOW_DB_PASS: root
+        run: composer test

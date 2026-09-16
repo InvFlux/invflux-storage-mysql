@@ -1,0 +1,63 @@
+{
+    "name": "nandan108/invflux-storage-mysql",
+    "version": "0.1.0",
+    "description": "A persistence layer for InvFlux.",
+    "type": "library",
+    "license": [
+        "GPL-2.0-or-later",
+        "LicenseRef-InvFlux-Commercial"
+    ],
+    "autoload": {
+        "psr-4": {
+            "Nandan108\\InvFlux\\Storage\\Mysql\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Nandan108\\InvFlux\\Storage\\Mysql\\Tests\\": "tests/"
+        }
+    },
+    "require": {
+        "php": "^8.1",
+        "ext-json": "*",
+        "nandan108/invflux-core": "^0.1",
+        "nandan108/slot-flow": "^0.3",
+        "nandan108/attrecord": "^0.21"
+    },
+    "require-dev": {
+        "php": "^8.1",
+        "nunomaduro/collision": "^6.4",
+        "phpunit/phpunit": "^10.0",
+        "vimeo/psalm": "^6.12",
+        "friendsofphp/php-cs-fixer": "^3.92",
+        "wikimedia/composer-merge-plugin": "^2.0",
+        "nandan108/attrecord-migrations": "^0.8"
+    },
+    "extra": {
+        "merge-plugin": {
+            "include": [
+                "composer.local.json"
+            ],
+            "recurse": true,
+            "replace": true,
+            "ignore-duplicates": false
+        }
+    },
+    "authors": [
+        {
+            "name": "Samuel de Rougemont",
+            "email": "nandan108@gmail.com"
+        }
+    ],
+    "scripts": {
+        "cs-fix": "./vendor/bin/php-cs-fixer fix --allow-risky=yes --diff",
+        "psalm": "./vendor/bin/psalm",
+        "test": "./vendor/bin/phpunit -c phpunit.xml.dist",
+        "testAndCover": "./vendor/bin/phpunit -c phpunit.xml.dist --coverage-text --coverage-html coverage"
+    },
+    "config": {
+        "allow-plugins": {
+            "wikimedia/composer-merge-plugin": true
+        }
+    }
+}

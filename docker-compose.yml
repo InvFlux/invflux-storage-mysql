@@ -1,0 +1,32 @@
+services:
+  invflux-mariadb:
+    image: mariadb:11.8
+    container_name: invflux-mariadb
+    restart: unless-stopped
+    environment:
+      MARIADB_ROOT_PASSWORD: root
+      MARIADB_DATABASE: invflux_test
+      MARIADB_USER: invflux
+      MARIADB_PASSWORD: invflux
+    ports:
+      - "33067:3306"
+    # The datadir is RAM, not disk, and this instance holds nothing but disposable test schemas.
+    #
+    # Integration setUp drops and re-converges the ~60 managed tables to get a clean slate, so a
+    # suite issues thousands of DDL statements. Each one costs several fsyncs on the datadir, which
+    # a copy-on-write filesystem serves at a few milliseconds apiece — ~25 ms per CREATE/DROP here,
+    # ~3.6 s per test on schema alone, and the DDL ends up dwarfing the tests. On tmpfs the same
+    # cycle is ~0.14 s. Durability buys nothing: every table is recreated by the next setUp anyway.
+    #
+    # The trade-off is that a container restart re-initializes the server from scratch — hence the
+    # initdb mount below, which puts the lane grants back without anyone remembering to.
+    tmpfs:
+      - /var/lib/mysql:rw,size=2g
+    volumes:
+      - ./docker/test-db-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "mariadb-admin", "ping", "-h", "127.0.0.1", "-uroot", "-proot"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
