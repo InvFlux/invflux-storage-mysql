@@ -1304,7 +1304,7 @@ final class MysqlInventoryStore implements InventoryStore
     #[\Override]
     public function countNonZeroSlots(SubjectId $subjectId): int
     {
-        return $this->fetchCountFromSql(
+        return $this->fetchIntValue(
             sprintf(
                 'SELECT COUNT(*)
                  FROM %s s
@@ -2038,53 +2038,58 @@ final class MysqlInventoryStore implements InventoryStore
     /** Multiply all persisted quantity columns by one factor. */
     private function multiplyQuantityColumns(int $factor): void
     {
-        $this->executeSQL(<<<SQL
-            UPDATE ::TABLE_INVENTORY_STATE
-            SET quantity = quantity * ?
-        SQL, [$factor]);
+        $this->executeSQL(
+            'UPDATE ::TABLE_INVENTORY_STATE
+            SET quantity = quantity * :factor
+        ',
+            ['factor' => $factor],
+        );
 
-        $this->executeSQL(<<<SQL
-            UPDATE ::TABLE_INVENTORY_LEDGER
-            SET quantity = quantity * ?,
-                initial_from = CASE WHEN initial_from IS NULL THEN NULL ELSE initial_from * ? END,
-                initial_to = CASE WHEN initial_to IS NULL THEN NULL ELSE initial_to * ? END
-        SQL, [$factor, $factor, $factor]);
+        $this->executeSQL(
+            'UPDATE ::TABLE_INVENTORY_LEDGER
+            SET quantity = quantity * :factor,
+                initial_from = CASE WHEN initial_from IS NULL THEN NULL ELSE initial_from * :factor END,
+                initial_to = CASE WHEN initial_to IS NULL THEN NULL ELSE initial_to * :factor END
+        ',
+            ['factor' => $factor],
+        );
     }
 
     /** Divide all persisted quantity columns by one factor after divisibility checks. */
     private function divideQuantityColumns(int $factor): void
     {
-        $this->executeSQL(<<<SQL
-            UPDATE ::TABLE_INVENTORY_STATE
-            SET quantity = quantity DIV ?
-        SQL, [$factor]);
+        $this->executeSQL(
+            "UPDATE {$this->table(self::TABLE_INVENTORY_STATE)}
+            SET quantity = quantity DIV :factor
+        ",
+            ['factor' => $factor],
+        );
 
-        $this->executeSQL(<<<SQL
-            UPDATE ::TABLE_INVENTORY_LEDGER
-            SET quantity = quantity DIV ?,
-                initial_from = CASE WHEN initial_from IS NULL THEN NULL ELSE initial_from DIV ? END,
-                initial_to = CASE WHEN initial_to IS NULL THEN NULL ELSE initial_to DIV ? END
-        SQL, [$factor, $factor, $factor]);
+        $this->executeSQL(
+            "UPDATE {$this->table(self::TABLE_INVENTORY_LEDGER)}
+            SET quantity = quantity DIV :factor,
+                initial_from = CASE WHEN initial_from IS NULL THEN NULL ELSE initial_from DIV :factor END,
+                initial_to = CASE WHEN initial_to IS NULL THEN NULL ELSE initial_to DIV :factor END
+        ",
+            ['factor' => $factor],
+        );
     }
 
     /** Ensure decreasing the scale would not lose precision in persisted quantities. */
     private function assertScaleDecreaseIsSafe(int $factor): void
     {
-        $stateCount = $this->fetchCountFromSql(sprintf(
-            'SELECT COUNT(*) FROM %s WHERE MOD(ABS(quantity), %d) <> 0',
-            $this->table(self::TABLE_INVENTORY_STATE),
-            $factor,
-        ));
-        $ledgerCount = $this->fetchCountFromSql(sprintf(
-            'SELECT COUNT(*) FROM %s
-             WHERE MOD(ABS(quantity), %d) <> 0
-                OR (initial_from IS NOT NULL AND MOD(ABS(initial_from), %d) <> 0)
-                OR (initial_to IS NOT NULL AND MOD(ABS(initial_to), %d) <> 0)',
-            $this->table(self::TABLE_INVENTORY_LEDGER),
-            $factor,
-            $factor,
-            $factor,
-        ));
+        $stateCount = $this->fetchIntValue(
+            "SELECT COUNT(*) FROM {$this->table(self::TABLE_INVENTORY_STATE)}
+             WHERE MOD(ABS(quantity), :factor) <> 0",
+            ['factor' => $factor],
+        );
+        $ledgerCount = $this->fetchIntValue(
+            "SELECT COUNT(*) FROM {$this->table(self::TABLE_INVENTORY_LEDGER)}
+             WHERE MOD(ABS(quantity), :factor) <> 0
+                OR (initial_from IS NOT NULL AND MOD(ABS(initial_from), :factor) <> 0)
+                OR (initial_to IS NOT NULL AND MOD(ABS(initial_to), :factor) <> 0)",
+            ['factor' => $factor],
+        );
 
         if (0 !== $stateCount || 0 !== $ledgerCount) {
             throw new ConfigurationException(
@@ -5725,15 +5730,17 @@ final class MysqlInventoryStore implements InventoryStore
     {
         $this->createBaseTables();
 
-        $row = $this->fetchOneRow(<<<SQL
-            SELECT outcome_code, completed_at
-            FROM ::TABLE_IDEMPOTENCY
+        $row = $this->fetchOneRow(
+            "SELECT outcome_code, completed_at
+            FROM {$this->table(self::TABLE_IDEMPOTENCY)}
             WHERE scope = :scope AND operation_key = :operation_key
             LIMIT 1
-        SQL, [
-            'scope'         => $key->scope,
-            'operation_key' => $key->operationKey,
-        ]);
+        ",
+            [
+                'scope'         => $key->scope,
+                'operation_key' => $key->operationKey,
+            ],
+        );
 
         if (!is_array($row) || null === $row['completed_at']) {
             return null;
@@ -5797,11 +5804,11 @@ final class MysqlInventoryStore implements InventoryStore
         // scary-looking "Duplicate entry" line on every idempotent replay.
         // INSERT IGNORE silently no-ops the conflict; we detect the outcome
         // via affected_rows (1 = inserted, 0 = duplicate-key).
-        $affected = $this->executeSQLCount(<<<SQL
-            INSERT IGNORE INTO ::TABLE_IDEMPOTENCY
+        $affected = $this->executeSQLCount("
+            INSERT IGNORE INTO {$this->table(self::TABLE_IDEMPOTENCY)}
             (scope, operation_key, outcome_code, payload_json, created_at, completed_at)
             VALUES (:scope, :operation_key, :outcome_code, :payload_json, :created_at, :completed_at)
-        SQL, [
+        ", [
             'scope'         => $key->scope,
             'operation_key' => $key->operationKey,
             'outcome_code'  => null,
@@ -5830,27 +5837,31 @@ final class MysqlInventoryStore implements InventoryStore
 
     private function deleteIdempotencyClaim(IdempotencyKey $key): void
     {
-        $this->executeSQL(<<<SQL
-            DELETE FROM ::TABLE_IDEMPOTENCY
+        $this->executeSQL(
+            "DELETE FROM {$this->table(self::TABLE_IDEMPOTENCY)}
             WHERE scope = :scope AND operation_key = :operation_key
-        SQL, [
-            'scope'         => $key->scope,
-            'operation_key' => $key->operationKey,
-        ]);
+        ",
+            [
+                'scope'         => $key->scope,
+                'operation_key' => $key->operationKey,
+            ],
+        );
     }
 
     private function loadIdempotentExecution(IdempotencyKey $key): IdempotentExecution
     {
-        $row = $this->fetchOneRow(<<<SQL
-            SELECT outcome_code, payload_json, completed_at
-            FROM ::TABLE_IDEMPOTENCY
+        $row = $this->fetchOneRow(
+            "SELECT outcome_code, payload_json, completed_at
+            FROM {$this->table(self::TABLE_IDEMPOTENCY)}
             WHERE scope = :scope
               AND operation_key = :operation_key
             LIMIT 1
-        SQL, [
-            'scope'         => $key->scope,
-            'operation_key' => $key->operationKey,
-        ]);
+        ",
+            [
+                'scope'         => $key->scope,
+                'operation_key' => $key->operationKey,
+            ],
+        );
         is_array($row) || throw new PersistenceException(
             sprintf('Missing idempotency row for scope "%s" and key "%s".', $key->scope, $key->operationKey),
             'missing_idempotency_row',
@@ -5882,7 +5893,7 @@ final class MysqlInventoryStore implements InventoryStore
         $count = 0;
         foreach ($tables as $table) {
             $sql = sprintf('SELECT COUNT(*) FROM %s', $this->table($table));
-            $count += $this->fetchCountFromSql($sql);
+            $count += $this->fetchIntValue($sql);
         }
 
         return $count;
@@ -5897,16 +5908,16 @@ final class MysqlInventoryStore implements InventoryStore
     }
 
     /**
-     * Execute one COUNT(*) query and return its integer result.
+     * Execute query that returns a single scalar and return its integer result.
      *
      * @param array<string, scalar|null> $params
      */
-    private function fetchCountFromSql(string $sql, array $params = []): int
+    private function fetchIntValue(string $sql, array $params = []): int
     {
-        $count = $this->session->fetchScalar($sql, $params);
-        is_scalar($count) || throw new PersistenceException('Expected count query to return a scalar value.', 'invalid_count_result');
+        $scalar = $this->session->fetchScalar($sql, $params);
+        is_scalar($scalar) || throw new PersistenceException('Expected query to return a scalar value.', 'invalid_scalar_result');
 
-        return (int) $count;
+        return (int) $scalar;
     }
 
     /**
