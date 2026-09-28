@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Nandan108\InvFlux\Storage\Mysql;
 
+use Nandan108\Attrecord\BinaryParam;
 use Nandan108\Attrecord\Enum\OnConflict;
 use Nandan108\Attrecord\RawSql;
 use Nandan108\Attrecord\Record as AttrecordRecord;
@@ -837,7 +838,7 @@ final class MysqlInventoryStore implements InventoryStore
 
         /** @var array<int<0, max>|non-empty-string, non-empty-string|null>|null $resolvedTarget */
         $resolvedTarget = $this->resolveDrainTarget($dimension, $source, $targetValue);
-        $sourceValueId = $this->dimensionValueIdByName($dimensionName, $sourceValue);
+        $sourceValueId = $this->dimensionValueId($dimensionName, $sourceValue);
         $updatedDimension = $this->dimensionWithValueState($dimension, $sourceValue, false);
         $dimensionId = $this->dimensionIdByName($dimensionName);
 
@@ -1851,7 +1852,7 @@ final class MysqlInventoryStore implements InventoryStore
         $activeSlotKeys = [];
         foreach ($slotSpace->matchPartial([]) as $slot) {
             $params = [
-                'id'            => $minter->mint(),
+                'id'            => new BinaryParam($minter->mint()),
                 'layer_id'      => $layerId,
                 'slot_key'      => $slot->key,
                 'active'        => 1,
@@ -2500,8 +2501,15 @@ final class MysqlInventoryStore implements InventoryStore
         return $id;
     }
 
-    /** Return the stored numeric id for one declared dimension value. */
-    private function dimensionValueIdByName(string $dimensionName, string $valueName): int
+    /**
+     * Return the stored numeric id for one declared dimension value.
+     *
+     * Public since a domain row came to reference a dimension value by foreign key
+     * (`SubjectCost.cost_area_id`): the rest of the system addresses a value by code, and this is
+     * the one place that can turn a code into the id such a reference has to hold.
+     */
+    #[\Override]
+    public function dimensionValueId(string $dimensionName, string $valueCode): int
     {
         $id = $this->fetchScalarValue(sprintf(
             'SELECT dv.id
@@ -2514,12 +2522,12 @@ final class MysqlInventoryStore implements InventoryStore
             $this->table(self::TABLE_DIMENSIONS),
         ), [
             'dimension_name' => $dimensionName,
-            'code'           => $valueName,
+            'code'           => $valueCode,
         ]);
         is_scalar($id) || throw new SchemaException(
-            sprintf('Unknown dimension value "%s:%s".', $dimensionName, $valueName),
+            sprintf('Unknown dimension value "%s:%s".', $dimensionName, $valueCode),
             'unknown_dimension_value',
-            ['dimensionName' => $dimensionName, 'value' => $valueName],
+            ['dimensionName' => $dimensionName, 'value' => $valueCode],
         );
 
         return (int) $id;
@@ -2986,7 +2994,7 @@ final class MysqlInventoryStore implements InventoryStore
         foreach ($recodes as $i => $recode) {
             $keyCases .= sprintf(' WHEN :id%d THEN :key%d', $i, $i);
             $dimCases .= sprintf(' WHEN :id%d THEN :dim%d', $i, $i);
-            $params['id'.$i] = $recode['id'];
+            $params['id'.$i] = new BinaryParam($recode['id']);
             $params['key'.$i] = $recode['slotKey'];
             $params['dim'.$i] = $recode['dimValue'];
             $idKeys[] = ':id'.$i;
@@ -3048,8 +3056,8 @@ final class MysqlInventoryStore implements InventoryStore
             $idCases .= sprintf(' WHEN :src%d THEN CAST(:new%d AS BINARY)', $i, $i);
             $keyCases .= sprintf(' WHEN :src%d THEN :key%d', $i, $i);
             $dimCases .= sprintf(' WHEN :src%d THEN :dim%d', $i, $i);
-            $params['src'.$i] = $row['id'];
-            $params['new'.$i] = $this->uuidMinter->mint();
+            $params['src'.$i] = new BinaryParam($row['id']);
+            $params['new'.$i] = new BinaryParam($this->uuidMinter->mint());
             $params['key'.$i] = $row['slotKey'];
             $params['dim'.$i] = $row['dimValue'];
             $sourceKeys[] = ':src'.$i;
@@ -3153,7 +3161,7 @@ final class MysqlInventoryStore implements InventoryStore
                 $this->table(self::TABLE_DIMENSION_VALUES),
                 $this->table(self::TABLE_SLOTSPACE),
                 $placeholders,
-            ), [$locDimId, ...$leafSlotIds]);
+            ), [$locDimId, ...self::binaryParams($leafSlotIds)]);
         } catch (PersistenceException) {
             return $deltaRows;
         }
@@ -4585,7 +4593,7 @@ final class MysqlInventoryStore implements InventoryStore
                 $this->session->exec(sprintf(
                     'INSERT IGNORE INTO %s (subject_id, slot_id, quantity) VALUES (:subject_id, :slot_id, 0)',
                     $this->table(self::TABLE_INVENTORY_STATE),
-                ), ['subject_id' => $subjectId, 'slot_id' => $slotId]);
+                ), ['subject_id' => $subjectId, 'slot_id' => new BinaryParam($slotId)]);
             }
             $locked = $this->selectSingleSubjectLocked($subjectId, $bySlotId);
         }
@@ -4621,7 +4629,7 @@ final class MysqlInventoryStore implements InventoryStore
              FOR UPDATE',
             $this->table(self::TABLE_INVENTORY_STATE),
             $placeholders,
-        ), [$subjectId, ...$slotIds]) as $row) {
+        ), [$subjectId, ...self::binaryParams($slotIds)]) as $row) {
             $slotId = $this->requireStringField($row, 'slot_id');
             $deltaRow = $bySlotId[$slotId] ?? null;
             if (null === $deltaRow) {
@@ -4659,9 +4667,9 @@ final class MysqlInventoryStore implements InventoryStore
         $slotIds = [];
         foreach ($deltaRows as $i => $row) {
             $cases .= sprintf(' WHEN :slot%d THEN :delta%d', $i, $i);
-            $caseParams['slot'.$i] = $row->slotId;
+            $caseParams['slot'.$i] = new BinaryParam($row->slotId);
             $caseParams['delta'.$i] = $row->delta;
-            $slotIds['inslot'.$i] = $row->slotId;
+            $slotIds['inslot'.$i] = new BinaryParam($row->slotId);
         }
         $inPlaceholders = implode(', ', array_map(static fn (string $k): string => ':'.$k, array_keys($slotIds)));
 
@@ -4718,7 +4726,7 @@ final class MysqlInventoryStore implements InventoryStore
         $params = [];
         foreach ($deltaRows as $row) {
             $params[] = $row->subjectId;
-            $params[] = $row->slotId;
+            $params[] = new BinaryParam($row->slotId);
             $params[] = $row->slotKey;
             $params[] = $row->delta;
             $params[] = $row->minQuantity;
@@ -5602,7 +5610,7 @@ final class MysqlInventoryStore implements InventoryStore
     }
 
     /**
-     * @param array<array-key, scalar|null> $params
+     * @param array<array-key, scalar|BinaryParam|null> $params
      *
      * @return array<string, scalar|null>|null
      */
@@ -5612,7 +5620,22 @@ final class MysqlInventoryStore implements InventoryStore
     }
 
     /**
-     * @param array<array-key, scalar|null> $params
+     * Mark each binary id for binding as bytes rather than text.
+     *
+     * Some backends need the distinction — SQLite never compares a BLOB equal to TEXT — so every
+     * binary value this store binds by hand goes through here or a direct {@see BinaryParam}.
+     *
+     * @param list<string> $ids raw binary ids
+     *
+     * @return list<BinaryParam>
+     */
+    private static function binaryParams(array $ids): array
+    {
+        return array_map(static fn (string $id): BinaryParam => new BinaryParam($id), $ids);
+    }
+
+    /**
+     * @param array<array-key, scalar|BinaryParam|null> $params
      *
      * @return list<array<string, scalar|null>>
      */
@@ -5622,7 +5645,7 @@ final class MysqlInventoryStore implements InventoryStore
     }
 
     /**
-     * @param array<array-key, scalar|null> $params
+     * @param array<array-key, scalar|BinaryParam|null> $params
      */
     private function fetchScalarValue(string $sql, array $params = []): string | int | float | null
     {

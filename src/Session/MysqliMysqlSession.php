@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Nandan108\InvFlux\Storage\Mysql\Session;
 
+use Nandan108\Attrecord\BinaryParam;
 use Nandan108\InvFlux\Exceptions\InvFluxException;
 use Nandan108\InvFlux\Exceptions\PersistenceException;
 
@@ -70,7 +71,7 @@ final class MysqliMysqlSession implements MysqlSession
     }
 
     /**
-     * @param array<array-key, scalar|null> $params
+     * @param array<array-key, scalar|BinaryParam|null> $params
      */
     /** @psalm-suppress PossiblyUnusedReturnValue required by the shared session contract */
     #[\Override]
@@ -82,7 +83,7 @@ final class MysqliMysqlSession implements MysqlSession
     }
 
     /**
-     * @param array<array-key, scalar|null> $params
+     * @param array<array-key, scalar|BinaryParam|null> $params
      *
      * @return list<array<string, scalar|null>>
      */
@@ -102,7 +103,7 @@ final class MysqliMysqlSession implements MysqlSession
     }
 
     /**
-     * @param array<array-key, scalar|null> $params
+     * @param array<array-key, scalar|BinaryParam|null> $params
      *
      * @return array<string, scalar|null>|null
      */
@@ -121,7 +122,7 @@ final class MysqliMysqlSession implements MysqlSession
     }
 
     /**
-     * @param array<array-key, scalar|null> $params
+     * @param array<array-key, scalar|BinaryParam|null> $params
      */
     #[\Override]
     public function fetchScalar(string $sql, array $params = []): string | int | float | null
@@ -235,7 +236,7 @@ final class MysqliMysqlSession implements MysqlSession
     }
 
     /**
-     * @param array<array-key, scalar|null> $params
+     * @param array<array-key, scalar|BinaryParam|null> $params
      */
     private function queryInternal(string $sql, array $params = []): \mysqli_result | bool
     {
@@ -254,7 +255,7 @@ final class MysqliMysqlSession implements MysqlSession
     }
 
     /**
-     * @param array<array-key, scalar|null> $params
+     * @param array<array-key, scalar|BinaryParam|null> $params
      */
     private function interpolate(string $sql, array $params): string
     {
@@ -275,8 +276,8 @@ final class MysqliMysqlSession implements MysqlSession
                     return '?';
                 }
                 $value = $params[$index++];
-                is_string($value) || is_int($value) || is_float($value) || null === $value || throw new PersistenceException(
-                    'SQL parameter must be string, int, float, or null.',
+                is_string($value) || is_int($value) || is_float($value) || null === $value || $value instanceof BinaryParam || throw new PersistenceException(
+                    'SQL parameter must be string, int, float, binary, or null.',
                     'invalid_sql_parameter_type',
                 );
 
@@ -288,7 +289,7 @@ final class MysqliMysqlSession implements MysqlSession
         return $substituted ?? throw new PersistenceException('SQL parameter interpolation failed.', 'sql_interpolation_failed');
     }
 
-    private function quoteValue(string | int | float | null $value): string
+    private function quoteValue(string | int | float | BinaryParam | null $value): string
     {
         if (null === $value) {
             return 'NULL';
@@ -296,6 +297,10 @@ final class MysqliMysqlSession implements MysqlSession
 
         if (is_int($value) || is_float($value)) {
             return (string) $value;
+        }
+
+        if ($value instanceof BinaryParam) {
+            return "X'".bin2hex($value->bytes)."'";
         }
 
         return "'".$this->mysqli->real_escape_string($value)."'";

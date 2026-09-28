@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Nandan108\InvFlux\Storage\Mysql\Order;
 
+use Nandan108\Attrecord\BinaryParam;
 use Nandan108\Attrecord\RecordSet;
 use Nandan108\InvFlux\Domain\Shipment\Shipment;
 use Nandan108\InvFlux\Domain\Shipment\ShipmentLine;
@@ -31,20 +32,28 @@ final class MysqlShipmentRepository implements ShipmentRepository
             return;
         }
 
+        // Both halves of the parentage are stamped here, not left to the caller. `shipment_id` is
+        // the shipment we just saved and only exists now; `order_id` is copied from that shipment
+        // rather than trusted from the line, so the two cannot disagree — and the schema will not
+        // let them, since `(shipment_id, order_id)` is a foreign key against the shipment's own
+        // `(id, order_id)`. Copying it is how that constraint is satisfied by construction instead
+        // of by a writer remembering.
         foreach ($lines as $line) {
             $line->shipment_id = $shipment->id;
+            $line->order_id = $shipment->order_id;
         }
         // Shipment lines are write-once (ShipmentLine is AppendOnly): insertAll() is one plain
-        // INSERT that throws on a duplicate minted PK. upsertAll() would take its keyed-upsert path
-        // here (the PK is minted in beforeSave, before upsertAll's insert/upsert partition), silently
-        // swallowing a duplicate via INSERT IGNORE — wrong for an immutable dispatch record.
+        // INSERT that throws on a duplicate key. upsertAll() would take its keyed-upsert path here
+        // and silently swallow a duplicate via INSERT IGNORE — wrong for an immutable dispatch
+        // record, and now a duplicate means "this shipment already ships that line", which is
+        // precisely the thing the key exists to refuse.
         (new RecordSet($lines))->insertAll();
     }
 
     #[\Override]
     public function forOrder(string $orderId): array
     {
-        $set = Shipment::find('`order_id` = ?', [$orderId], 'ORDER BY `created_at` ASC, `id` ASC');
+        $set = Shipment::find('`order_id` = ?', [new BinaryParam($orderId)], 'ORDER BY `created_at` ASC, `id` ASC');
         $list = [];
         foreach ($set as $shipment) {
             $list[] = $shipment;
@@ -56,7 +65,9 @@ final class MysqlShipmentRepository implements ShipmentRepository
     #[\Override]
     public function linesForShipment(string $shipmentId): array
     {
-        $set = ShipmentLine::find('`shipment_id` = ?', [$shipmentId], 'ORDER BY `id` ASC');
+        // Ordered by the line's number within its order — the key's second member, and the only
+        // stable ordering left now that the surrogate id is gone.
+        $set = ShipmentLine::find('`shipment_id` = ?', [new BinaryParam($shipmentId)], 'ORDER BY `order_line_id` ASC');
         $list = [];
         foreach ($set as $line) {
             $list[] = $line;

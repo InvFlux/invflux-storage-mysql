@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Nandan108\InvFlux\Storage\Mysql\Order;
 
+use Nandan108\Attrecord\BinaryParam;
 use Nandan108\InvFlux\Domain\Order\OrderCorrection;
 use Nandan108\InvFlux\Domain\Order\OrderCorrectionRepository;
 
@@ -28,7 +29,7 @@ final class MysqlOrderCorrectionRepository implements OrderCorrectionRepository
     {
         $set = OrderCorrection::find(
             '`order_id` = ?',
-            [$orderId],
+            [new BinaryParam($orderId)],
             'ORDER BY `created_at` ASC, `id` ASC',
         );
         $list = [];

@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Nandan108\InvFlux\Storage\Mysql\Session;
 
+use Nandan108\Attrecord\BinaryParam;
 use Nandan108\InvFlux\Exceptions\InvFluxException;
 use Nandan108\InvFlux\Exceptions\PersistenceException;
 
@@ -77,7 +78,7 @@ final class PdoMysqlSession implements MysqlSession
     }
 
     /**
-     * @param array<array-key, scalar|null> $params
+     * @param array<array-key, scalar|BinaryParam|null> $params
      */
     #[\Override]
     public function exec(string $sql, array $params = []): int
@@ -92,7 +93,7 @@ final class PdoMysqlSession implements MysqlSession
     }
 
     /**
-     * @param array<array-key, scalar|null> $params
+     * @param array<array-key, scalar|BinaryParam|null> $params
      *
      * @return list<array<string, scalar|null>>
      */
@@ -112,7 +113,7 @@ final class PdoMysqlSession implements MysqlSession
     }
 
     /**
-     * @param array<array-key, scalar|null> $params
+     * @param array<array-key, scalar|BinaryParam|null> $params
      *
      * @return array<string, scalar|null>|null
      */
@@ -131,7 +132,7 @@ final class PdoMysqlSession implements MysqlSession
     }
 
     /**
-     * @param array<array-key, scalar|null> $params
+     * @param array<array-key, scalar|BinaryParam|null> $params
      */
     #[\Override]
     public function fetchScalar(string $sql, array $params = []): string | int | float | null
@@ -281,7 +282,7 @@ final class PdoMysqlSession implements MysqlSession
     }
 
     /**
-     * @param array<array-key, scalar|null> $params
+     * @param array<array-key, scalar|BinaryParam|null> $params
      */
     private function prepareAndExecute(string $sql, array $params): \PDOStatement
     {
@@ -298,6 +299,11 @@ final class PdoMysqlSession implements MysqlSession
 
             if (null === $value) {
                 $stmt->bindValue($parameter, null, \PDO::PARAM_NULL);
+                continue;
+            }
+
+            if ($value instanceof BinaryParam) {
+                $stmt->bindValue($parameter, $value->bytes, \PDO::PARAM_LOB);
                 continue;
             }
 

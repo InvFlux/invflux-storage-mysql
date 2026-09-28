@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Nandan108\InvFlux\Storage\Mysql\Order;
 
+use Nandan108\Attrecord\BinaryParam;
 use Nandan108\InvFlux\Domain\Order\MonetaryEventPayload;
 use Nandan108\InvFlux\Domain\Order\OrderEvent;
 use Nandan108\InvFlux\Domain\Order\OrderEventStore;
@@ -34,7 +35,7 @@ final class MysqlOrderEventStore implements OrderEventStore
     {
         $set = OrderEvent::find(
             '`order_id` = ?',
-            [$orderId],
+            [new BinaryParam($orderId)],
             sprintf('ORDER BY `occurred_at` DESC, `id` DESC LIMIT %d', max(1, $limit)),
         );
         $list = [];

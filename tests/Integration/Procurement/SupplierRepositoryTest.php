@@ -28,6 +28,7 @@ use Nandan108\InvFlux\Domain\Subject\SubjectKind;
 use Nandan108\InvFlux\Identity\ActorRecord;
 use Nandan108\InvFlux\Identity\ActorTypeRecord;
 use Nandan108\InvFlux\Identity\RefTypeRecord;
+use Nandan108\InvFlux\Schema\DimensionValueDefinition;
 use Nandan108\InvFlux\Schema\SlotSpaceFactory;
 use Nandan108\InvFlux\Storage\Mysql\MysqlDomainStore;
 use Nandan108\InvFlux\Storage\Mysql\MysqlInventoryStore;
@@ -44,6 +45,7 @@ final class SupplierRepositoryTest extends TestCase
 {
     private ?\PDO $pdo = null;
     private ?MysqlDomainStore $domainStore = null;
+    private ?MysqlInventoryStore $inventoryStore = null;
 
     #[\Override]
     protected function setUp(): void
@@ -79,6 +81,7 @@ final class SupplierRepositoryTest extends TestCase
         $inventoryStore = new MysqlInventoryStore($session);
         $inventoryStore->bootstrap((new SlotSpaceFactory())->createLayered());
         $this->domainStore->bootstrap();
+        $this->inventoryStore = $inventoryStore;
     }
 
     public function testCreateSupplierMintsSupplierActorAndPersists(): void
@@ -230,15 +233,27 @@ final class SupplierRepositoryTest extends TestCase
         $subject->save();
         $subjectId = (int) $subject->id;
 
+        // `loc` is a sharedRef dimension, so bootstrapping the slot space registers no values —
+        // and a cost row has to name the area it is denominated in. Registering one here rather
+        // than in setUp() keeps it where it is load-bearing.
+        $inventory = $this->inventoryStore();
+        $inventory->addDimensionValues('loc', [
+            new DimensionValueDefinition(SlotSpaceFactory::DEFAULT_LOCATION_SEED, level: 'warehouse'),
+        ]);
+        $costAreaId = $inventory->dimensionValueId('loc', SlotSpaceFactory::DEFAULT_LOCATION_SEED);
+
         SubjectCost::newWith([
             'subject_id'        => $subjectId,
+            'cost_area_id'      => $costAreaId,
             'seed_cost'         => '7.5000',
             'weighted_avg_cost' => '7.5000',
             'cost_currency'     => 'EUR',
         ])->save();
 
-        $cost = SubjectCost::where('subject_id', $subjectId)->first();
+        // Addressed by its whole key, which is what the row's identity now is.
+        $cost = SubjectCost::getOne(['subject_id' => $subjectId, 'cost_area_id' => $costAreaId]);
         self::assertNotNull($cost);
+        self::assertSame($costAreaId, $cost->cost_area_id, 'the area round-trips as part of the key');
         self::assertSame('7.5000', $cost->seed_cost);
         self::assertSame('7.5000', $cost->weighted_avg_cost);
         self::assertSame('EUR', $cost->cost_currency);
@@ -581,6 +596,13 @@ final class SupplierRepositoryTest extends TestCase
         \assert($this->domainStore instanceof MysqlDomainStore);
 
         return $this->domainStore;
+    }
+
+    private function inventoryStore(): MysqlInventoryStore
+    {
+        \assert($this->inventoryStore instanceof MysqlInventoryStore);
+
+        return $this->inventoryStore;
     }
 
     private function dropTables(): void

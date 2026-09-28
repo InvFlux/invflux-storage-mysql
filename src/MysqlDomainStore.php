@@ -5,10 +5,13 @@ declare(strict_types=1);
 namespace Nandan108\InvFlux\Storage\Mysql;
 
 use Nandan108\Attrecord\Connection;
+use Nandan108\Attrecord\DbSession;
 use Nandan108\Attrecord\Enum\OnConflict;
 use Nandan108\Attrecord\LockSet;
 use Nandan108\Attrecord\Record;
 use Nandan108\Attrecord\RecordSet;
+use Nandan108\Attrecord\WhereClause;
+use Nandan108\InvFlux\Domain\Label\LabelTranslation;
 use Nandan108\InvFlux\Domain\Procurement\DocumentParty;
 use Nandan108\InvFlux\Domain\Procurement\DocumentPartyDecision;
 use Nandan108\InvFlux\Domain\Procurement\GoodsReceipt;
@@ -142,8 +145,8 @@ final class MysqlDomainStore implements SupplierRepository, PurchaseOrderReposit
 
     /**
      * Domain Records that belong to neither registry above: the subject worksheets (a saved
-     * selection of subjects plus its items) and the per-subject stock-concern projection that
-     * backs the workbench's stock-state badge.
+     * selection of subjects plus its items), the per-subject stock-concern projection that backs
+     * the workbench's stock-state badge, and the merchant's own label translations.
      *
      * @var list<class-string<Record>>
      */
@@ -151,6 +154,10 @@ final class MysqlDomainStore implements SupplierRepository, PurchaseOrderReposit
         SubjectWorksheetRecord::class,
         SubjectWorksheetItemRecord::class,
         SubjectStockConcern::class,
+        // The merchant's translations of the labels they typed, for every labelled entity at once
+        // (tags today, locations and reason codes next). Polymorphic by `entity_key` and so
+        // without a foreign key, like Annotation — position is free.
+        LabelTranslation::class,
     ];
 
     private bool $referenceTablesInstalled = false;
@@ -356,6 +363,12 @@ final class MysqlDomainStore implements SupplierRepository, PurchaseOrderReposit
         $link->delete();
     }
 
+    #[\Override]
+    public function findSupplierProduct(int $supplierId, int $subjectId): ?SupplierProduct
+    {
+        return SupplierProduct::getOne(['supplier_id' => $supplierId, 'subject_id' => $subjectId]);
+    }
+
     /**
      * @return list<SupplierProduct>
      */
@@ -548,68 +561,111 @@ final class MysqlDomainStore implements SupplierRepository, PurchaseOrderReposit
     }
 
     /**
-     * Intern terms and read back the hash the engine computed for them.
+     * Intern terms and return the hash the database computed for them.
      *
-     * **Raw SQL because attrecord cannot express this, not because the operation deserves it.** The
-     * hash is a generated column, so unlike a party — whose key the application computes and can
-     * therefore look up — nothing here knows the digest until the row exists. The upsert makes
-     * `LAST_INSERT_ID()` name the row whether this call created it or found one already on file,
-     * which is what turns "insert or find" into a single answer. Retreat to attrecord when it grows
-     * an insert-or-fetch that returns the stored row.
+     * **Look up first, then insert.** The hash is a generated column, so nothing here knows the
+     * digest until a row exists; the text itself is the only handle. The lookup is by `body`, and
+     * the candidates are then compared **byte for byte** — the column's collation ignores case (and,
+     * on MySQL, accents), so `WHERE body = ?` returns a superset that may hold text hashing
+     * differently, and only an exact comparison agrees with a digest taken over bytes.
      *
-     * **Not a lookup by `body`**, which is the obvious alternative and is wrong: the column's
-     * collation is case- and accent-insensitive, so `WHERE body = ?` matches text that hashes
-     * differently, and interning would return the hash of somebody else's terms. The digest is over
-     * bytes; only the engine's own key comparison agrees with it.
+     * **The lookup is a full table scan, deliberately.** `body` is TEXT and unindexed; the table's
+     * only indexes are its two unique keys. That is safe on a volume assumption, not a property of
+     * the code: a merchant's terms run to hundreds of rows over decades, and interning runs only
+     * when terms are saved — never on a read path. If terms ever reach a hot path or real volume,
+     * this is the query to revisit.
      *
-     * **The row the upsert lands on is checked, because it may hold different terms.** Two things
-     * send it to another text's row, and they are told apart by what that row holds:
+     * **A duplicate-key error is resolved from the data, never from the message**, which differs
+     * by engine. On any such error the lookup runs again and decides:
      *
-     *  - **A key collision** — different terms own the key these would take. The text is written
-     *    again at its next {@see Terms::$attempt}, which moves its key somewhere unrelated, and the
-     *    same terms interned later retrace the same steps to the same row.
-     *  - **A reused printed reference** — the reference's own unique key matched a row holding other
-     *    terms. Refused rather than moved: moving it would print one reference on two artefacts.
+     *  - **Exact match on the text and reference** — someone else interned the same terms
+     *    concurrently. Their hash is the answer.
+     *  - **The reference is held by different terms** — refused: moving it would print one
+     *    reference on two artefacts.
+     *  - **Neither** — a key collision: different terms own the key these would take. The text is
+     *    written again at its next {@see Terms::$attempt}, which moves its key somewhere unrelated,
+     *    and the same terms interned later find the row by text before reaching the key at all.
      *
-     * Idempotent, and cheap to retry: re-interning the same artefact returns the same hash and mints
-     * no row. It costs an auto-increment id per duplicate, which a `BIGINT UNSIGNED` will not notice.
+     * One path for every backend: an atomic upsert would need an engine-specific way to return the
+     * row it landed on, and a path one engine never runs is a path nobody tests there.
+     *
+     * Idempotent, and cheap to retry: re-interning the same artefact returns the same hash and
+     * mints no row.
      */
     #[\Override]
     public function internTerms(string $body, ?string $publicRef = null): int
     {
-        $session = $this->session ?? $this->connection->session;
-        $table = $this->table('invflux_terms');
+        $connection = null !== $this->session
+            ? new Connection($this->session, $this->connection->dialect)
+            : $this->connection;
 
-        for ($attempt = 0; $attempt <= Terms::MAX_KEY_ATTEMPTS; ++$attempt) {
-            $session->exec(
-                sprintf(
-                    'INSERT INTO `%s` (body, public_ref, attempt, created_at) VALUES (?, ?, ?, NOW(6))
-                     ON DUPLICATE KEY UPDATE id = LAST_INSERT_ID(id)',
-                    $table,
-                ),
-                [$body, $publicRef, 0 === $attempt ? null : $attempt],
-            );
-            /** @psalm-var array{content_hash: int|string, body: string, public_ref: ?string}|null $row */
-            $row = $session->fetchOne(
-                sprintf('SELECT content_hash, body, public_ref FROM `%s` WHERE id = LAST_INSERT_ID()', $table),
-            );
-            if (null === $row) {
-                throw new \RuntimeException('The terms row just written could not be read back.');
+        return Terms::usingConnection($connection, function () use ($connection, $body, $publicRef): int {
+            $existing = self::internedTerms($connection, $body, $publicRef);
+            if (null !== $existing) {
+                return $existing->content_hash;
             }
 
-            // Compared here, byte for byte: the column's collation ignores case, and the digest does not.
-            if ($row['body'] === $body && $row['public_ref'] === $publicRef) {
-                return (int) $row['content_hash'];
+            for ($attempt = 0; $attempt <= Terms::MAX_KEY_ATTEMPTS; ++$attempt) {
+                $terms = Terms::newWith([
+                    'body'       => $body,
+                    'public_ref' => $publicRef,
+                    'attempt'    => 0 === $attempt ? null : $attempt,
+                ]);
+
+                try {
+                    $terms->save(readBack: ['content_hash']);
+
+                    return $terms->content_hash;
+                } catch (\Throwable $e) {
+                    if (!self::isDuplicateKey($connection->session, $e)) {
+                        throw $e;
+                    }
+                }
+
+                $existing = self::internedTerms($connection, $body, $publicRef);
+                if (null !== $existing) {
+                    return $existing->content_hash;
+                }
+                if (null !== $publicRef && null !== Terms::findOne(WhereClause::where('public_ref', $publicRef))) {
+                    throw new \DomainException(sprintf('The reference "%s" is already printed on different terms.', $publicRef));
+                }
             }
-            if (null !== $publicRef && $row['public_ref'] === $publicRef) {
-                throw new \DomainException(sprintf('The reference "%s" is already printed on different terms.', $publicRef));
+
+            throw new \RuntimeException(sprintf(
+                'Terms key exhausted after %d attempts — distinct terms cannot plausibly collide that often, so treat this as corruption rather than bad luck.',
+                Terms::MAX_KEY_ATTEMPTS,
+            ));
+        });
+    }
+
+    /**
+     * The row already holding exactly these terms — same bytes, same reference — if any, read
+     * through `$connection` (the connection is a parameter so the lookup cannot run on another).
+     */
+    private static function internedTerms(Connection $connection, string $body, ?string $publicRef): ?Terms
+    {
+        return Terms::usingConnection($connection, static function () use ($body, $publicRef): ?Terms {
+            foreach (Terms::find(WhereClause::where('body', $body), [], 'ORDER BY id ASC') as $candidate) {
+                // Byte for byte: the collation matched a superset.
+                if ($candidate->body === $body && $candidate->public_ref === $publicRef) {
+                    return $candidate;
+                }
+            }
+
+            return null;
+        });
+    }
+
+    /** Whether any exception in the chain is the session's duplicate-key error. */
+    private static function isDuplicateKey(DbSession $session, \Throwable $e): bool
+    {
+        for ($t = $e; null !== $t; $t = $t->getPrevious()) {
+            if ($session->isDuplicateKeyError($t)) {
+                return true;
             }
         }
 
-        throw new \RuntimeException(sprintf(
-            'Terms key exhausted after %d attempts — distinct terms cannot plausibly collide that often, so treat this as corruption rather than bad luck.',
-            Terms::MAX_KEY_ATTEMPTS,
-        ));
+        return false;
     }
 
     #[\Override]

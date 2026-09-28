@@ -83,7 +83,7 @@ final class LockOrderBoundaryTest extends TestCase
     private const MOVEMENT = 'LOCKTEST';
     private const LOC = SlotSpaceFactory::DEFAULT_LOCATION_SEED;
 
-    /** Seeded into `atp.oh` so every reserve movement in this test has stock to move. */
+    /** Seeded into `oh.atp` so every reserve movement in this test has stock to move. */
     private const SEEDED_ATP = 1_000;
 
     /** Long enough to out-wait a real lock queue, short enough that a hang is not a 50s stall. */
@@ -139,7 +139,7 @@ final class LockOrderBoundaryTest extends TestCase
 
         // Start from bare tables, as the other integration suites do. Not optional here: `bootstrap()`
         // is idempotent, so a slot space left behind by a suite that declares *different* dimensions
-        // survives it, and this test's `atp.oh` / `res.oh` slots are then never created.
+        // survives it, and this test's `oh.atp` / `oh.res` slots are then never created.
         $this->dropInvfluxTables();
 
         $domainStore = new MysqlDomainStore($connA, tablePrefix: '', session: $sessionA);
@@ -534,7 +534,7 @@ final class LockOrderBoundaryTest extends TestCase
         );
     }
 
-    /** The movement both transactions make: reserve one unit, `atp.oh → res.oh`. */
+    /** The movement both transactions make: reserve one unit, `oh.atp → oh.res`. */
     private function movement(?SubjectId $subject = null): PersistMovement
     {
         // The live layer, from the store that was bootstrapped in setUp — not a space compiled
@@ -570,7 +570,7 @@ final class LockOrderBoundaryTest extends TestCase
      */
     private function seedStock(SubjectId $subject): void
     {
-        foreach (['atp.'.self::LOC => self::SEEDED_ATP, 'res.'.self::LOC => 0] as $slotKey => $quantity) {
+        foreach ([self::LOC.'.atp' => self::SEEDED_ATP, self::LOC.'.res' => 0] as $slotKey => $quantity) {
             $statement = $this->pdo()->prepare('SELECT id FROM invflux_slotspace WHERE slot_key = ?');
             $statement->execute([$slotKey]);
             /** @var array{id: string}|false $row */
@@ -622,7 +622,7 @@ final class LockOrderBoundaryTest extends TestCase
              JOIN invflux_slotspace sp ON sp.id = s.slot_id
              WHERE s.subject_id = ? AND sp.slot_key = ?',
         );
-        $statement->execute([$this->subject()->id, 'atp.'.self::LOC]);
+        $statement->execute([$this->subject()->id, self::LOC.'.atp']);
         /** @var array{quantity: scalar}|false $row */
         $row = $statement->fetch();
 

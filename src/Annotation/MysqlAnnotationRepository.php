@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Nandan108\InvFlux\Storage\Mysql\Annotation;
 
+use Nandan108\Attrecord\BinaryParam;
 use Nandan108\InvFlux\Domain\Annotation\Annotation;
 use Nandan108\InvFlux\Domain\Annotation\AnnotationRepository;
 use Nandan108\InvFlux\Domain\Annotation\AnnotationTarget;
@@ -46,7 +47,7 @@ final class MysqlAnnotationRepository implements AnnotationRepository
     public function forThread(string $threadId): array
     {
         $list = [];
-        foreach (Annotation::find('`thread_id` = ?', [$threadId], 'ORDER BY `version` ASC') as $row) {
+        foreach (Annotation::find('`thread_id` = ?', [new BinaryParam($threadId)], 'ORDER BY `version` ASC') as $row) {
             $list[] = $row;
         }
 

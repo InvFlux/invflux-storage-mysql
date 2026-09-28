@@ -104,6 +104,16 @@ final class ReceiveGoodsTest extends TestCase
     }
 
     /**
+     * The area a cost row must name, asked of the store rather than written as a literal — it is a
+     * surrogate id, so the value it takes is whatever order the seeds ran in, and a test that
+     * hardcodes one passes until somebody registers a dimension value earlier.
+     */
+    private function costArea(): int
+    {
+        return $this->inventoryStore()->dimensionValueId('loc', self::LOC);
+    }
+
+    /**
      * The bug this guards: a goods receipt used to be two client round trips, so a failure between
      * them left stock moved while the order still said it was expecting the goods — and the retry
      * that followed passed the same status check and received the delivery a second time. One key,
@@ -260,7 +270,11 @@ final class ReceiveGoodsTest extends TestCase
         $subject->save();
         $subjectId = (int) $subject->id;
 
-        SubjectCost::newWith(['subject_id' => $subjectId, 'seed_cost' => '3.5000'])->save();
+        SubjectCost::newWith([
+            'subject_id'   => $subjectId,
+            'cost_area_id' => $this->costArea(),
+            'seed_cost'    => '3.5000',
+        ])->save();
 
         ($this->receiveGoods())(
             GoodsReceipt::newWith(['reason' => ReceiptReason::FoundStock]),
@@ -654,6 +668,13 @@ final class ReceiveGoodsTest extends TestCase
         \assert($this->receiveGoods instanceof ReceiveGoods);
 
         return $this->receiveGoods;
+    }
+
+    private function inventoryStore(): MysqlInventoryStore
+    {
+        \assert($this->inventoryStore instanceof MysqlInventoryStore);
+
+        return $this->inventoryStore;
     }
 
     private function pdo(): \PDO

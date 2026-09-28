@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Nandan108\InvFlux\Storage\Mysql\Session;
 
+use Nandan108\Attrecord\BinaryParam;
 use Nandan108\InvFlux\Exceptions\PersistenceException;
 
 /**
@@ -14,18 +15,18 @@ use Nandan108\InvFlux\Exceptions\PersistenceException;
 final class NamedPlaceholderSql
 {
     /**
-     * @param array<array-key, scalar|null> $params
+     * @param array<array-key, scalar|BinaryParam|null> $params
      *
-     * @return array{sql: string, params: list<scalar|null>}
+     * @return array{sql: string, params: list<scalar|BinaryParam|null>}
      */
     public static function positional(string $sql, array $params): array
     {
         if (array_is_list($params)) {
-            /** @var list<scalar|null> $params */
+            /** @var list<scalar|BinaryParam|null> $params */
             return ['sql' => $sql, 'params' => $params];
         }
 
-        /** @var list<scalar|null> $ordered */
+        /** @var list<scalar|BinaryParam|null> $ordered */
         $ordered = [];
         $normalizedSql = preg_replace_callback(
             '/:([a-zA-Z_][a-zA-Z0-9_]*)/',
@@ -40,8 +41,8 @@ final class NamedPlaceholderSql
                 }
 
                 $value = $params[$name];
-                is_scalar($value) || null === $value || throw new PersistenceException(
-                    sprintf('SQL parameter "%s" must be scalar or null.', $name),
+                is_scalar($value) || null === $value || $value instanceof BinaryParam || throw new PersistenceException(
+                    sprintf('SQL parameter "%s" must be scalar, binary or null.', $name),
                     'invalid_sql_parameter',
                     ['parameter' => $name],
                 );
