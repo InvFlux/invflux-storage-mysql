@@ -42,8 +42,12 @@ final class SubjectWorksheetItemRecord extends Record
     #[Column(ColumnType::IntUnsigned)]
     public int $subject_id = 0;
 
-    #[Column(ColumnType::Decimal, nullable: true, precision: 15, scale: 4)]
-    public ?float $quantity = null;
+    /**
+     * The quantity proposed for the subject, as every stored quantity is: an integer at the subject's
+     * quantity scale (scale 0 counts whole units). Null when the worksheet has not set one.
+     */
+    #[Column(ColumnType::IntUnsigned, nullable: true)]
+    public ?int $quantity = null;
 
     /** @var array<string, mixed>|null Reserved substrate; JsonCaster auto-attaches on the array-typed Json column. */
     #[Column(ColumnType::Json, nullable: true)]

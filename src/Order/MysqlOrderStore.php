@@ -170,7 +170,7 @@ final class MysqlOrderStore
             $codesByTiming[$reason->timing->value][] = $reason->code;
         }
         foreach ($codesByTiming as $timing => $codes) {
-            // The enum case, not its value: the column's caster serialises the case.
+            // The enum case, not its value: the column's caster serializes the case.
             OrderCorrectionReason::updateWhere(['timing' => CorrectionTiming::from($timing)], WhereClause::whereIn('code', $codes));
         }
 

@@ -71,7 +71,7 @@ final class DeadlockAwareRetryPolicyTest extends TestCase
 
         $policy = new DeadlockAwareRetryPolicy(new FakeMysqlSession(retryable: true), retryDeadlocks: false);
 
-        self::assertFalse($policy($outer), 'still recognised as a deadlock through the wrapper');
+        self::assertFalse($policy($outer), 'still recognized as a deadlock through the wrapper');
     }
 
     public function testDeadlockDetectedViaErrnoOnWrappedPreviousException(): void

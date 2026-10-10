@@ -288,14 +288,14 @@ final class SupplierRepositoryTest extends TestCase
         $line->save();
 
         // qty_open is a GENERATED VIRTUAL column: GREATEST(0, qty_requested - qty_received).
-        $fresh = PurchaseOrderLine::where('id', $line->id)->first();
+        $fresh = PurchaseOrderLine::getOne(['po_id' => $line->po_id, 'subject_id' => $line->subject_id]);
         self::assertNotNull($fresh);
         self::assertSame(10, $fresh->qty_open, 'qty_open = 10 - 0');
 
         // Bumping the app-maintained cache recomputes qty_open (also exercises the UPDATE path).
         $fresh->qty_received = 4;
         $fresh->save();
-        $afterReceipt = PurchaseOrderLine::where('id', $line->id)->first();
+        $afterReceipt = PurchaseOrderLine::getOne(['po_id' => $line->po_id, 'subject_id' => $line->subject_id]);
         self::assertNotNull($afterReceipt);
         self::assertSame(6, $afterReceipt->qty_open, 'qty_open = 10 - 4');
 
@@ -306,7 +306,7 @@ final class SupplierRepositoryTest extends TestCase
 
         ReceiptLine::newWith([
             'receipt_id'         => $receipt->id,
-            'po_line_id'         => $line->id,
+            'po_id'              => $line->po_id,
             'subject_id'         => $subjectId,
             'qty'                => 4,
             'unit_cost_snapshot' => '5.0000',
@@ -445,11 +445,11 @@ final class SupplierRepositoryTest extends TestCase
         // First receipt: 4 of 10.
         $receipt = $this->store()->recordReceipt(
             GoodsReceipt::newWith(['source_ref_type_id' => $this->poRefTypeId(), 'source_id' => $po->id, 'note' => 'partial']),
-            [ReceiptLine::newWith(['po_line_id' => $line->id, 'subject_id' => $subjectId, 'qty' => 4])],
+            [ReceiptLine::newWith(['po_id' => $line->po_id, 'subject_id' => $subjectId, 'qty' => 4])],
         );
         self::assertNotNull($receipt->id);
 
-        $afterFirst = PurchaseOrderLine::where('id', $line->id)->first();
+        $afterFirst = PurchaseOrderLine::getOne(['po_id' => $line->po_id, 'subject_id' => $line->subject_id]);
         self::assertNotNull($afterFirst);
         self::assertSame(4, $afterFirst->qty_received);
         self::assertSame(6, $afterFirst->qty_open, 'qty_open recomputed after the receipt bump');
@@ -457,9 +457,9 @@ final class SupplierRepositoryTest extends TestCase
         // Second receipt: the remaining 6.
         $this->store()->recordReceipt(
             GoodsReceipt::newWith(['source_ref_type_id' => $this->poRefTypeId(), 'source_id' => $po->id]),
-            [ReceiptLine::newWith(['po_line_id' => $line->id, 'subject_id' => $subjectId, 'qty' => 6])],
+            [ReceiptLine::newWith(['po_id' => $line->po_id, 'subject_id' => $subjectId, 'qty' => 6])],
         );
-        $afterSecond = PurchaseOrderLine::where('id', $line->id)->first();
+        $afterSecond = PurchaseOrderLine::getOne(['po_id' => $line->po_id, 'subject_id' => $line->subject_id]);
         self::assertNotNull($afterSecond);
         self::assertSame(10, $afterSecond->qty_received);
         self::assertSame(0, $afterSecond->qty_open, 'fully received');
@@ -561,8 +561,13 @@ final class SupplierRepositoryTest extends TestCase
     public function testDeliveryDiscrepancyRollupCountsOverAndFinalizedShort(): void
     {
         $store = $this->store();
-        $subject = Subject::newWith(['kind' => SubjectKind::Unit]);
-        $subject->save();
+        // One product per line: an order carries one line per product.
+        $subjects = [];
+        for ($i = 0; $i < 4; ++$i) {
+            $subjects[$i] = Subject::newWith(['kind' => SubjectKind::Unit]);
+            $subjects[$i]->save();
+        }
+        $subject = $subjects[0];
         $supplier = $store->createSupplier(Supplier::newWith(['name' => 'Rollup Co']));
 
         // PO with a mix: one over (received > ordered), one finalized-short (closed-short → qty_open 0),
@@ -571,10 +576,10 @@ final class SupplierRepositoryTest extends TestCase
             PurchaseOrder::newWith(['supplier_id' => $supplier->id, 'currency' => 'EUR']),
         );
         $store->savePurchaseOrderLines([
-            PurchaseOrderLine::newWith(['po_id' => $poWithDiscrepancies->id, 'subject_id' => $subject->id, 'qty_requested' => 10, 'qty_received' => 12]),
-            PurchaseOrderLine::newWith(['po_id' => $poWithDiscrepancies->id, 'subject_id' => $subject->id, 'qty_requested' => 10, 'qty_received' => 7, 'qty_closed_short' => 3]),
-            PurchaseOrderLine::newWith(['po_id' => $poWithDiscrepancies->id, 'subject_id' => $subject->id, 'qty_requested' => 10, 'qty_received' => 4]),
-            PurchaseOrderLine::newWith(['po_id' => $poWithDiscrepancies->id, 'subject_id' => $subject->id, 'qty_requested' => 10, 'qty_received' => 10]),
+            PurchaseOrderLine::newWith(['po_id' => $poWithDiscrepancies->id, 'subject_id' => $subjects[0]->id, 'qty_requested' => 10, 'qty_received' => 12]),
+            PurchaseOrderLine::newWith(['po_id' => $poWithDiscrepancies->id, 'subject_id' => $subjects[1]->id, 'qty_requested' => 10, 'qty_received' => 7, 'qty_closed_short' => 3]),
+            PurchaseOrderLine::newWith(['po_id' => $poWithDiscrepancies->id, 'subject_id' => $subjects[2]->id, 'qty_requested' => 10, 'qty_received' => 4]),
+            PurchaseOrderLine::newWith(['po_id' => $poWithDiscrepancies->id, 'subject_id' => $subjects[3]->id, 'qty_requested' => 10, 'qty_received' => 10]),
         ]);
 
         // A clean PO (exact only) must be absent from the rollup.
@@ -589,6 +594,92 @@ final class SupplierRepositoryTest extends TestCase
         self::assertSame(['over' => 1, 'short' => 1], $rollup[(int) $poWithDiscrepancies->id] ?? null);
         self::assertArrayNotHasKey((int) $cleanPo->id, $rollup, 'a discrepancy-free PO is absent');
         self::assertSame([], $store->deliveryDiscrepancyRollup([]));
+    }
+
+    /**
+     * Lines read back in the order they were added — not by product id, which is what the key alone
+     * would give — and a later batch continues the numbering rather than restarting it.
+     */
+    public function testLinesKeepTheOrderTheyWereAddedIn(): void
+    {
+        $store = $this->store();
+        $supplier = $store->createSupplier(Supplier::newWith(['name' => 'Order Co']));
+        $po = $store->createPurchaseOrder(PurchaseOrder::newWith(['supplier_id' => $supplier->id, 'currency' => 'EUR']));
+        $ids = [];
+        for ($i = 0; $i < 4; ++$i) {
+            $subject = Subject::newWith(['kind' => SubjectKind::Unit]);
+            $subject->save();
+            $ids[] = (int) $subject->id;
+        }
+        // Added highest product id first, so product order and add order disagree.
+        [$a, $b, $c, $d] = array_reverse($ids);
+        $store->savePurchaseOrderLines([
+            PurchaseOrderLine::newWith(['po_id' => $po->id, 'subject_id' => $a, 'qty_requested' => 1]),
+            PurchaseOrderLine::newWith(['po_id' => $po->id, 'subject_id' => $b, 'qty_requested' => 1]),
+        ]);
+        $store->savePurchaseOrderLines([
+            PurchaseOrderLine::newWith(['po_id' => $po->id, 'subject_id' => $c, 'qty_requested' => 1]),
+            PurchaseOrderLine::newWith(['po_id' => $po->id, 'subject_id' => $d, 'qty_requested' => 1]),
+        ]);
+
+        $read = $store->linesForPurchaseOrder((int) $po->id);
+        self::assertSame([$a, $b, $c, $d], array_map(static fn (PurchaseOrderLine $l): int => $l->subject_id, $read));
+        self::assertSame([1, 2, 3, 4], array_map(static fn (PurchaseOrderLine $l): int => $l->position, $read));
+    }
+
+    /**
+     * An order whose places have crept to the column's ceiling (lines added and removed over a long
+     * edit) is renumbered compactly, in its current order, before a new line is placed — never
+     * clamped into a tie by a non-strict server.
+     */
+    public function testAnOrderAtTheCeilingIsRenumberedBeforeANewLineIsPlaced(): void
+    {
+        $store = $this->store();
+        $supplier = $store->createSupplier(Supplier::newWith(['name' => 'Ceiling Co']));
+        $po = $store->createPurchaseOrder(PurchaseOrder::newWith(['supplier_id' => $supplier->id, 'currency' => 'EUR']));
+        $ids = [];
+        for ($i = 0; $i < 3; ++$i) {
+            $subject = Subject::newWith(['kind' => SubjectKind::Unit]);
+            $subject->save();
+            $ids[] = (int) $subject->id;
+        }
+        $store->savePurchaseOrderLines([
+            PurchaseOrderLine::newWith(['po_id' => $po->id, 'subject_id' => $ids[0], 'qty_requested' => 1, 'position' => 65000]),
+            PurchaseOrderLine::newWith(['po_id' => $po->id, 'subject_id' => $ids[1], 'qty_requested' => 1, 'position' => 65535]),
+        ]);
+
+        $store->savePurchaseOrderLines([
+            PurchaseOrderLine::newWith(['po_id' => $po->id, 'subject_id' => $ids[2], 'qty_requested' => 1]),
+        ]);
+
+        $read = $store->linesForPurchaseOrder((int) $po->id);
+        self::assertSame([$ids[0], $ids[1], $ids[2]], array_map(static fn (PurchaseOrderLine $l): int => $l->subject_id, $read));
+        self::assertSame([1, 2, 3], array_map(static fn (PurchaseOrderLine $l): int => $l->position, $read));
+    }
+
+    /**
+     * A batch naming one product twice for one order is refused, loudly. Under the line's composite
+     * key the database would not refuse it: the save coalesces on the key, so the second line would
+     * silently replace the first.
+     */
+    public function testSavingTwoLinesForOneProductOnOneOrderIsRefused(): void
+    {
+        $store = $this->store();
+        $subject = Subject::newWith(['kind' => SubjectKind::Unit]);
+        $subject->save();
+        $supplier = $store->createSupplier(Supplier::newWith(['name' => 'Twice Co']));
+        $po = $store->createPurchaseOrder(PurchaseOrder::newWith(['supplier_id' => $supplier->id, 'currency' => 'EUR']));
+
+        try {
+            $store->savePurchaseOrderLines([
+                PurchaseOrderLine::newWith(['po_id' => $po->id, 'subject_id' => $subject->id, 'qty_requested' => 3]),
+                PurchaseOrderLine::newWith(['po_id' => $po->id, 'subject_id' => $subject->id, 'qty_requested' => 9]),
+            ]);
+            self::fail('a batch repeating a product on one order was saved');
+        } catch (\InvalidArgumentException $e) {
+            self::assertStringContainsString('one line per product', $e->getMessage());
+        }
+        self::assertSame([], $store->linesForPurchaseOrder((int) $po->id), 'nothing was written');
     }
 
     private function store(): MysqlDomainStore

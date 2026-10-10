@@ -659,7 +659,7 @@ final class MysqlInventoryStore implements InventoryStore
      * `path`, `parent_id` and `level`, the same recode across its descendants, the `dim_*` column
      * and key of its slot rows, and one INSERT for the parent.
      *
-     * The relabelling is retroactive and truthful — the location did not move, it acquired a
+     * The relabeling is retroactive and truthful — the location did not move, it acquired a
      * longer name — but it is invisible in the data, so `location_hierarchised` records it. That
      * row is what explains a movement rendering under a code minted after it.
      *
@@ -3277,7 +3277,7 @@ final class MysqlInventoryStore implements InventoryStore
 
         // Storage-layer enforcement of movement eligibility: a subject participates only if
         // InvFlux governs it AND its kind owns slots. Filtered here rather than in each adapter so
-        // every caller gets the behaviour automatically; silent skip rather than exception because
+        // every caller gets the behavior automatically; silent skip rather than exception because
         // an order line for something uncounted is a legitimate order line. See
         // partitionByMovementEligibility() for both reasons and why neither throws.
         $skippedUnmanagedSubjectIds = [];
@@ -3937,7 +3937,7 @@ final class MysqlInventoryStore implements InventoryStore
      * Split a requested-subject list into [participating, skipped] sublists.
      *
      * Two independent reasons disqualify a subject from an inventory movement, and both are
-     * checked here so every caller — adapter, CLI, future integrations — gets the behaviour
+     * checked here so every caller — adapter, CLI, future integrations — gets the behavior
      * automatically rather than re-deriving it:
      *
      *  - **not governed** (`ivfx_governed = 0`): InvFlux does not own this subject's count.
@@ -6368,7 +6368,7 @@ final class MysqlInventoryStore implements InventoryStore
             return;
         }
 
-        // A value appearing twice in one call cannot be honoured for both subjects, and choosing
+        // A value appearing twice in one call cannot be honored for both subjects, and choosing
         // silently would bury a caller's data defect under a result that looks fine.
         $seen = [];
         foreach ($claims as $assignment) {
@@ -7251,7 +7251,7 @@ final class MysqlInventoryStore implements InventoryStore
             // The claim's identifier value is in the message, not only in the context array. This
             // is thrown from a bulk resolve that can be carrying tens of thousands of claims, so
             // "a unit cannot be a child of a unit" on its own says only that one row in the batch
-            // is wrong — and leaves the reader to find it across the whole catalogue.
+            // is wrong — and leaves the reader to find it across the whole catalog.
             throw new ConfigurationException(
                 sprintf(
                     'A %s subject cannot be a child of a %s subject (identifier "%s", parent subject %d). '

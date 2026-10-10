@@ -28,7 +28,7 @@ namespace Nandan108\InvFlux\Storage\Mysql\Tests\Support;
  *
  *     INVFLUX_TEST_LANE=lock-order composer test
  *
- * Deliberately opt-in. With no lane set, behaviour is exactly what it has always been (shared
+ * Deliberately opt-in. With no lane set, behavior is exactly what it has always been (shared
  * `invflux_test`), so a contributor who does nothing is unaffected and CI — which gets a private
  * instance per job anyway — needs no configuration.
  *
@@ -55,7 +55,7 @@ final class TestDatabase
 
         $lane = self::sanitizeLane((string) getenv('INVFLUX_TEST_LANE'));
         if ('' === $lane) {
-            return; // No lane: the historical shared-database behaviour, unchanged.
+            return; // No lane: the historical shared-database behavior, unchanged.
         }
 
         $database = self::PREFIX.$lane;

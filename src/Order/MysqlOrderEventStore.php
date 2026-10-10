@@ -84,7 +84,7 @@ final class MysqlOrderEventStore implements OrderEventStore
                 continue; // pending-manual schedules are settled by the operator, never auto-executed
             }
             if ($this->hasTerminalSibling($scheduled)) {
-                continue; // already confirmed or cancelled
+                continue; // already confirmed or canceled
             }
             $due[] = $scheduled;
             if (\count($due) >= $limit) {
@@ -97,7 +97,7 @@ final class MysqlOrderEventStore implements OrderEventStore
 
     /**
      * Whether a `refund.scheduled` has a terminal sibling — a
-     * `correction.refund_confirmed` or `refund.cancelled` sharing its correlation_id
+     * `correction.refund_confirmed` or `refund.canceled` sharing its correlation_id
      * and back-referencing it via payload `scheduled_event_id`. `refund.failed` is
      * non-terminal (retryable), so it does not count.
      */
@@ -110,10 +110,10 @@ final class MysqlOrderEventStore implements OrderEventStore
         $scheduledHex = \bin2hex((string) $scheduled->id);
         foreach ($this->byCorrelation($correlationId) as $sibling) {
             if (OrderEventType::CorrectionRefundConfirmed->value !== $sibling->event_type
-                && OrderEventType::RefundCancelled->value !== $sibling->event_type) {
+                && OrderEventType::RefundCanceled->value !== $sibling->event_type) {
                 continue;
             }
-            // correction.refund_confirmed → array payload; refund.cancelled → monetary VO.
+            // correction.refund_confirmed → array payload; refund.canceled → monetary VO.
             /** @psalm-var mixed $sid */
             $sid = $sibling->payload instanceof MonetaryEventPayload
                 ? ($sibling->payload->extras['scheduled_event_id'] ?? null)

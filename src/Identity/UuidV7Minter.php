@@ -37,7 +37,7 @@ final class UuidV7Minter
      * @param int|\Closure(): int $nodeId Range 1..4095 — the install's permanent
      *                                    federation node identity, persisted in
      *                                    invflux_settings.federation.node_id. The value 0
-     *                                    is reserved as an "uninitialised" sentinel.
+     *                                    is reserved as an "uninitialized" sentinel.
      *
      *                    Pass a closure to defer resolution (e.g. an option read)
      *                    until the first {@see mint()} — a request that never mints

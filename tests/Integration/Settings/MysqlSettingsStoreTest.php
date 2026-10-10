@@ -248,6 +248,6 @@ final class MysqlSettingsStoreTest extends TestCase
 
     private function store(): MysqlSettingsStore
     {
-        return $this->store ?? throw new \LogicException('store not initialised');
+        return $this->store ?? throw new \LogicException('store not initialized');
     }
 }

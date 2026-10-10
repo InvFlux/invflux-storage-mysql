@@ -25,7 +25,7 @@ use PHPUnit\Framework\TestCase;
 /**
  * Interning purchase terms — the shared, content-addressed table an issued order points at.
  *
- * These exercise the property that makes the pointer safe: a row's identity is the artefact it
+ * These exercise the property that makes the pointer safe: a row's identity is the artifact it
  * holds, computed by the database rather than stated by us, so the same terms always reach the same
  * row and a row many orders point at cannot be rewritten.
  */
@@ -94,9 +94,9 @@ final class TermsRepositoryTest extends TestCase
 
     /**
      * **Case is content.** The digest is over bytes, so terms differing only in case are different
-     * artefacts and must reach different rows.
+     * artifacts and must reach different rows.
      *
-     * This is the discriminating case for how interning recognises its own row. The column's
+     * This is the discriminating case for how interning recognizes its own row. The column's
      * collation is case- and accent-insensitive, so `WHERE body = ?` — or a comparison made in SQL —
      * would treat this text as the row below and hand back a hash belonging to terms the merchant
      * never wrote. Nothing else in this file would notice.
@@ -120,7 +120,7 @@ final class TermsRepositoryTest extends TestCase
     }
 
     /**
-     * A printed reference is part of the artefact, so the same body under two references is two
+     * A printed reference is part of the artifact, so the same body under two references is two
      * rows — they print differently, and dedup must collapse only what is genuinely identical.
      */
     public function testAPrintedReferenceIsPartOfTheIdentity(): void
@@ -134,7 +134,7 @@ final class TermsRepositoryTest extends TestCase
 
     /**
      * A printed reference is fixed once assigned, so reusing it for other terms is refused rather
-     * than moved — moving it would print one reference on two different artefacts.
+     * than moved — moving it would print one reference on two different artifacts.
      */
     public function testAReferenceAlreadyPrintedOnOtherTermsIsRefused(): void
     {

@@ -8,6 +8,7 @@ use Nandan108\Attrecord\Connection;
 use Nandan108\Attrecord\Dialect\MysqlDialect;
 use Nandan108\Attrecord\Record as AttrecordRecord;
 use Nandan108\Attrecord\Session\PdoDbSession;
+use Nandan108\InvFlux\Application\Costing\WeightedAverage;
 use Nandan108\InvFlux\Application\Procurement\ReceiveGoods;
 use Nandan108\InvFlux\Domain\Procurement\GoodsReceipt;
 use Nandan108\InvFlux\Domain\Procurement\ProcurementMovementType;
@@ -135,7 +136,7 @@ final class ReceiveGoodsTest extends TestCase
         $key = new IdempotencyKey(scope: 'po_receipt', operationKey: 'po:'.(int) $po->id.':receive:once');
         $submit = fn (): GoodsReceipt => ($this->receiveGoods())(
             GoodsReceipt::newWith(['source_ref_type_id' => $this->poRefTypeId(), 'source_id' => $po->id]),
-            [ReceiptLine::newWith(['po_line_id' => $line->id, 'subject_id' => $subjectId, 'qty' => 6, 'unit_cost_snapshot' => '5.0000'])],
+            [ReceiptLine::newWith(['po_id' => $line->po_id, 'subject_id' => $subjectId, 'qty' => 6, 'unit_cost_snapshot' => '5.0000'])],
             new ActorReference('admin', '1'),
             self::LOC,
             $key,
@@ -155,7 +156,7 @@ final class ReceiveGoodsTest extends TestCase
         self::assertSame(1, GoodsReceipt::countWhere('source_id = ?', [(int) $po->id]), 'exactly one receipt on file');
 
         // The rollup bumped once, not twice — the assertion that would have caught the original bug.
-        $reloaded = PurchaseOrderLine::where('id', $line->id)->first();
+        $reloaded = PurchaseOrderLine::getOne(['po_id' => $line->po_id, 'subject_id' => $line->subject_id]);
         self::assertNotNull($reloaded);
         self::assertSame(6, $reloaded->qty_received);
         self::assertSame(4, $reloaded->qty_open);
@@ -186,7 +187,7 @@ final class ReceiveGoodsTest extends TestCase
 
         $submit = fn (string $token): GoodsReceipt => ($this->receiveGoods())(
             GoodsReceipt::newWith(['source_ref_type_id' => $this->poRefTypeId(), 'source_id' => $po->id]),
-            [ReceiptLine::newWith(['po_line_id' => $line->id, 'subject_id' => $subjectId, 'qty' => 5, 'unit_cost_snapshot' => '5.0000'])],
+            [ReceiptLine::newWith(['po_id' => $line->po_id, 'subject_id' => $subjectId, 'qty' => 5, 'unit_cost_snapshot' => '5.0000'])],
             new ActorReference('admin', '1'),
             self::LOC,
             new IdempotencyKey(scope: 'po_receipt', operationKey: 'po:'.(int) $po->id.':receive:'.$token),
@@ -198,7 +199,7 @@ final class ReceiveGoodsTest extends TestCase
         $submit('second-click');
 
         self::assertSame(2, GoodsReceipt::countWhere('source_id = ?', [(int) $po->id]));
-        $reloaded = PurchaseOrderLine::where('id', $line->id)->first();
+        $reloaded = PurchaseOrderLine::getOne(['po_id' => $line->po_id, 'subject_id' => $line->subject_id]);
         self::assertNotNull($reloaded);
         self::assertSame(10, $reloaded->qty_received, 'both deliveries counted');
     }
@@ -234,7 +235,7 @@ final class ReceiveGoodsTest extends TestCase
 
         $line = ReceiptLine::where('receipt_id', $receipt->id)->first();
         self::assertNotNull($line);
-        self::assertNull($line->po_line_id, 'no ordered line to count against');
+        self::assertNull($line->po_id, 'no ordered line to count against');
 
         // The stock moved in exactly as a PO receipt's would — same flow, same slot.
         $onHand = (int) $this->pdo()->query(
@@ -255,6 +256,45 @@ final class ReceiveGoodsTest extends TestCase
         // receipt, different movement type — otherwise an opening balance counts toward what
         // suppliers delivered, and no later reading can separate them again.
         self::assertSame('stock_intake', $this->lastMovementCode($subjectId));
+    }
+
+    /**
+     * A posted receipt reads back as a document: itself by id, and its lines in the order written —
+     * what the receipt screen shows. An id that names nothing reads as nothing, not as an error.
+     */
+    public function testAPostedReceiptReadsBackWithItsLines(): void
+    {
+        $store = $this->domainStore();
+        $ids = [];
+        foreach ([1, 2] as $_) {
+            $subject = Subject::newWith(['kind' => SubjectKind::Unit, 'ivfx_governed' => true]);
+            $subject->save();
+            $ids[] = (int) $subject->id;
+        }
+
+        $receipt = ($this->receiveGoods())(
+            GoodsReceipt::newWith(['reason' => ReceiptReason::PurchaseWithoutOrder, 'fx_rate' => '0.90000000']),
+            [
+                ReceiptLine::newWith(['subject_id' => $ids[1], 'qty' => 3, 'damaged_qty' => 1, 'unit_cost_snapshot' => '20.0000']),
+                ReceiptLine::newWith(['subject_id' => $ids[0], 'qty' => 5, 'unit_cost_snapshot' => '10.0000']),
+            ],
+            new ActorReference('admin', '1'),
+            self::LOC,
+        );
+
+        $read = $store->findGoodsReceipt((int) $receipt->id);
+        self::assertNotNull($read);
+        self::assertSame(ReceiptReason::PurchaseWithoutOrder, $read->reason);
+        self::assertSame('0.90000000', $read->fx_rate);
+        self::assertSame(
+            [[$ids[1], 3, 1, '20.0000'], [$ids[0], 5, 0, '10.0000']],
+            array_map(
+                static fn (ReceiptLine $l): array => [$l->subject_id, $l->qty, $l->damaged_qty, $l->unit_cost_snapshot],
+                $store->goodsReceiptLines((int) $receipt->id),
+            ),
+        );
+        self::assertNull($store->findGoodsReceipt(999999));
+        self::assertSame([], $store->goodsReceiptLines(999999));
     }
 
     /**
@@ -307,7 +347,7 @@ final class ReceiveGoodsTest extends TestCase
 
         // Buy 10 at 5.00, then receive 10 free ones.
         ($this->receiveGoods())(
-            GoodsReceipt::newWith(['reason' => ReceiptReason::SupplierDelivery]),
+            GoodsReceipt::newWith(['reason' => ReceiptReason::PurchaseWithoutOrder]),
             [ReceiptLine::newWith(['subject_id' => $subjectId, 'qty' => 10, 'unit_cost_snapshot' => '5.0000'])],
             new ActorReference('admin', '1'),
             self::LOC,
@@ -324,6 +364,66 @@ final class ReceiveGoodsTest extends TestCase
         // (10·5 + 10·0) / 20 = 2.50 — the free units are in the divisor, which is the whole point.
         self::assertSame(2.5, (float) $cost->weighted_avg_cost);
         self::assertSame(20, $this->forSaleQty($subjectId));
+    }
+
+    /**
+     * A receipt records what its weighting read — the product's on-hand just before it and the cost it
+     * was weighted against — on every line of that product. From those, its own lines and the same
+     * public functions the posting used, the average it left is reproduced to the last decimal; a
+     * product receiving its first stock carries no cost before, and the receipt's cost sets it.
+     */
+    public function testAReceiptRecordsWhatItsWeightingReadAndReproducesTheAverage(): void
+    {
+        $this->domainStore();
+        $a = Subject::newWith(['kind' => SubjectKind::Unit, 'ivfx_governed' => true]);
+        $a->save();
+        $b = Subject::newWith(['kind' => SubjectKind::Unit, 'ivfx_governed' => true]);
+        $b->save();
+        $aId = (int) $a->id;
+        $bId = (int) $b->id;
+
+        ($this->receiveGoods())(
+            GoodsReceipt::newWith(['reason' => ReceiptReason::PurchaseWithoutOrder]),
+            [ReceiptLine::newWith(['subject_id' => $aId, 'qty' => 10, 'unit_cost_snapshot' => '5.0000'])],
+            new ActorReference('admin', '1'),
+            self::LOC,
+        );
+        // Two lines of A on one receipt, and B's first stock.
+        $second = ($this->receiveGoods())(
+            GoodsReceipt::newWith(['reason' => ReceiptReason::PurchaseWithoutOrder]),
+            [
+                ReceiptLine::newWith(['subject_id' => $aId, 'qty' => 3, 'unit_cost_snapshot' => '8.0000']),
+                ReceiptLine::newWith(['subject_id' => $aId, 'qty' => 2, 'unit_cost_snapshot' => '9.0000']),
+                ReceiptLine::newWith(['subject_id' => $bId, 'qty' => 4, 'unit_cost_snapshot' => '6.0000']),
+            ],
+            new ActorReference('admin', '1'),
+            self::LOC,
+        );
+
+        $lines = [...ReceiptLine::find('receipt_id = ?', [(int) $second->id], 'ORDER BY id')];
+        self::assertCount(3, $lines);
+        foreach ($lines as $line) {
+            if ($aId === $line->subject_id) {
+                self::assertSame(10, $line->on_hand_before, 'every line of A carries the product-level figure');
+                self::assertSame('5.0000', $line->cost_before);
+            } else {
+                self::assertSame(0, $line->on_hand_before);
+                self::assertNull($line->cost_before, 'a first receipt was weighted against nothing');
+            }
+        }
+
+        // Reproduce each product's average from the receipt alone, through the posting's own functions.
+        [, $costedQty, $costedValue] = ReceiveGoods::aggregateBySubject($lines, 1.0);
+        foreach ([$aId => $lines[0], $bId => $lines[2]] as $subjectId => $line) {
+            $stored = SubjectCost::where('subject_id', $subjectId)->first()?->weighted_avg_cost;
+            self::assertSame(
+                $stored,
+                WeightedAverage::blend((int) $line->on_hand_before, $line->cost_before, $costedQty[$subjectId], $costedValue[$subjectId]),
+            );
+        }
+        // (10·5 + 3·8 + 2·9) / 15 = 6.1333; B's own 6.0000.
+        self::assertSame('6.1333', SubjectCost::where('subject_id', $aId)->first()?->weighted_avg_cost);
+        self::assertSame('6.0000', SubjectCost::where('subject_id', $bId)->first()?->weighted_avg_cost);
     }
 
     /**
@@ -387,13 +487,13 @@ final class ReceiveGoodsTest extends TestCase
         // Receive 6 of 10.
         $receipt = ($this->receiveGoods())(
             GoodsReceipt::newWith(['source_ref_type_id' => $this->poRefTypeId(), 'source_id' => $po->id]),
-            [ReceiptLine::newWith(['po_line_id' => $line->id, 'subject_id' => $subjectId, 'qty' => 6, 'unit_cost_snapshot' => '5.0000'])],
+            [ReceiptLine::newWith(['po_id' => $line->po_id, 'subject_id' => $subjectId, 'qty' => 6, 'unit_cost_snapshot' => '5.0000'])],
             new ActorReference('admin', '1'),
             self::LOC,
         );
 
         // Domain side: qty_received bumped, qty_open recomputed.
-        $reloaded = PurchaseOrderLine::where('id', $line->id)->first();
+        $reloaded = PurchaseOrderLine::getOne(['po_id' => $line->po_id, 'subject_id' => $line->subject_id]);
         self::assertNotNull($reloaded);
         self::assertSame(6, $reloaded->qty_received);
         self::assertSame(4, $reloaded->qty_open);
@@ -440,12 +540,12 @@ final class ReceiveGoodsTest extends TestCase
         // Second receipt: 4 @ 10.0000 → WAC = (6·5 + 4·10) / 10 = 7.0000.
         ($this->receiveGoods())(
             GoodsReceipt::newWith(['source_ref_type_id' => $this->poRefTypeId(), 'source_id' => $po->id]),
-            [ReceiptLine::newWith(['po_line_id' => $line->id, 'subject_id' => $subjectId, 'qty' => 4, 'unit_cost_snapshot' => '10.0000'])],
+            [ReceiptLine::newWith(['po_id' => $line->po_id, 'subject_id' => $subjectId, 'qty' => 4, 'unit_cost_snapshot' => '10.0000'])],
             new ActorReference('admin', '1'),
             self::LOC,
         );
 
-        $afterSecond = PurchaseOrderLine::where('id', $line->id)->first();
+        $afterSecond = PurchaseOrderLine::getOne(['po_id' => $line->po_id, 'subject_id' => $line->subject_id]);
         self::assertNotNull($afterSecond);
         self::assertSame(10, $afterSecond->qty_received);
         self::assertSame(0, $afterSecond->qty_open);
@@ -478,12 +578,12 @@ final class ReceiveGoodsTest extends TestCase
         // First delivery: 8 arrived, 3 of them damaged → 5 good into stock.
         ($this->receiveGoods())(
             GoodsReceipt::newWith(['source_ref_type_id' => $this->poRefTypeId(), 'source_id' => $po->id]),
-            [ReceiptLine::newWith(['po_line_id' => $line->id, 'subject_id' => $subjectId, 'qty' => 5, 'damaged_qty' => 3, 'unit_cost_snapshot' => '5.0000'])],
+            [ReceiptLine::newWith(['po_id' => $line->po_id, 'subject_id' => $subjectId, 'qty' => 5, 'damaged_qty' => 3, 'unit_cost_snapshot' => '5.0000'])],
             new ActorReference('admin', '1'),
             self::LOC,
         );
 
-        $afterFirst = PurchaseOrderLine::where('id', $line->id)->first();
+        $afterFirst = PurchaseOrderLine::getOne(['po_id' => $line->po_id, 'subject_id' => $line->subject_id]);
         self::assertNotNull($afterFirst);
         self::assertSame(5, $afterFirst->qty_received, 'qty_received counts good units only');
         self::assertSame(3, $afterFirst->qty_damaged, 'qty_damaged rollup carries the damaged units');
@@ -493,12 +593,12 @@ final class ReceiveGoodsTest extends TestCase
         // Second delivery: 4 arrived, 1 damaged → both rollups accumulate (9 good, 4 damaged).
         ($this->receiveGoods())(
             GoodsReceipt::newWith(['source_ref_type_id' => $this->poRefTypeId(), 'source_id' => $po->id]),
-            [ReceiptLine::newWith(['po_line_id' => $line->id, 'subject_id' => $subjectId, 'qty' => 3, 'damaged_qty' => 1, 'unit_cost_snapshot' => '5.0000'])],
+            [ReceiptLine::newWith(['po_id' => $line->po_id, 'subject_id' => $subjectId, 'qty' => 3, 'damaged_qty' => 1, 'unit_cost_snapshot' => '5.0000'])],
             new ActorReference('admin', '1'),
             self::LOC,
         );
 
-        $afterSecond = PurchaseOrderLine::where('id', $line->id)->first();
+        $afterSecond = PurchaseOrderLine::getOne(['po_id' => $line->po_id, 'subject_id' => $line->subject_id]);
         self::assertNotNull($afterSecond);
         self::assertSame(8, $afterSecond->qty_received, 'good rollup accumulates across deliveries');
         self::assertSame(4, $afterSecond->qty_damaged, 'damaged rollup accumulates across deliveries');
@@ -527,7 +627,7 @@ final class ReceiveGoodsTest extends TestCase
         // Receive 4 @ 10.00 USD, delivery rate 1.25 base/USD → base unit cost 12.50 → WAC 12.5000.
         ($this->receiveGoods())(
             GoodsReceipt::newWith(['source_ref_type_id' => $this->poRefTypeId(), 'source_id' => $po->id, 'fx_rate' => '1.25000000']),
-            [ReceiptLine::newWith(['po_line_id' => $line->id, 'subject_id' => $subjectId, 'qty' => 4, 'unit_cost_snapshot' => '10.0000'])],
+            [ReceiptLine::newWith(['po_id' => $line->po_id, 'subject_id' => $subjectId, 'qty' => 4, 'unit_cost_snapshot' => '10.0000'])],
             new ActorReference('admin', '1'),
             self::LOC,
         );
@@ -566,16 +666,16 @@ final class ReceiveGoodsTest extends TestCase
         ($this->receiveGoods())(
             GoodsReceipt::newWith(['source_ref_type_id' => $this->poRefTypeId(), 'source_id' => $po->id]),
             [
-                ReceiptLine::newWith(['po_line_id' => $lineA->id, 'subject_id' => $a, 'qty' => 6, 'unit_cost_snapshot' => '5.0000']),
-                ReceiptLine::newWith(['po_line_id' => $lineB->id, 'subject_id' => $b, 'qty' => 3, 'unit_cost_snapshot' => '8.0000']),
+                ReceiptLine::newWith(['po_id' => $lineA->po_id, 'subject_id' => $a, 'qty' => 6, 'unit_cost_snapshot' => '5.0000']),
+                ReceiptLine::newWith(['po_id' => $lineB->po_id, 'subject_id' => $b, 'qty' => 3, 'unit_cost_snapshot' => '8.0000']),
             ],
             new ActorReference('admin', '1'),
             self::LOC,
         );
 
         // Both PO lines bumped (bulk qty_received).
-        self::assertSame(6, PurchaseOrderLine::where('id', $lineA->id)->first()?->qty_received);
-        self::assertSame(3, PurchaseOrderLine::where('id', $lineB->id)->first()?->qty_received);
+        self::assertSame(6, PurchaseOrderLine::getOne(['po_id' => $lineA->po_id, 'subject_id' => $lineA->subject_id])?->qty_received);
+        self::assertSame(3, PurchaseOrderLine::getOne(['po_id' => $lineB->po_id, 'subject_id' => $lineB->subject_id])?->qty_received);
 
         // Both subjects got their stock in oh.atp.
         self::assertSame(6, $this->forSaleQty($a));
@@ -605,27 +705,25 @@ final class ReceiveGoodsTest extends TestCase
         $po = $domain->createPurchaseOrder(
             PurchaseOrder::newWith(['supplier_id' => $supplier->id, 'currency' => 'EUR']),
         );
-        // Two PO lines for the SAME subject, received together at different unit costs.
-        [$line1, $line2] = $domain->savePurchaseOrderLines([
+        // One ordered line (an order carries one line per product), received as two receipt lines
+        // at different unit costs — two pallets of the same product, say.
+        [$line] = $domain->savePurchaseOrderLines([
             PurchaseOrderLine::newWith([
-                'po_id' => $po->id, 'subject_id' => $sid, 'qty_requested' => 10]),
-            PurchaseOrderLine::newWith([
-                'po_id' => $po->id, 'subject_id' => $sid, 'qty_requested' => 10]),
+                'po_id' => $po->id, 'subject_id' => $sid, 'qty_requested' => 20]),
         ]);
 
         ($this->receiveGoods())(
             GoodsReceipt::newWith(['source_ref_type_id' => $this->poRefTypeId(), 'source_id' => $po->id]),
             [
-                ReceiptLine::newWith(['po_line_id' => $line1->id, 'subject_id' => $sid, 'qty' => 4, 'unit_cost_snapshot' => '5.0000']),
-                ReceiptLine::newWith(['po_line_id' => $line2->id, 'subject_id' => $sid, 'qty' => 6, 'unit_cost_snapshot' => '10.0000']),
+                ReceiptLine::newWith(['po_id' => $line->po_id, 'subject_id' => $sid, 'qty' => 4, 'unit_cost_snapshot' => '5.0000']),
+                ReceiptLine::newWith(['po_id' => $line->po_id, 'subject_id' => $sid, 'qty' => 6, 'unit_cost_snapshot' => '10.0000']),
             ],
             new ActorReference('admin', '1'),
             self::LOC,
         );
 
-        // Per-line qty_received is still tracked individually.
-        self::assertSame(4, PurchaseOrderLine::where('id', $line1->id)->first()?->qty_received);
-        self::assertSame(6, PurchaseOrderLine::where('id', $line2->id)->first()?->qty_received);
+        // Both receipt lines roll up onto the one ordered line.
+        self::assertSame(10, PurchaseOrderLine::getOne(['po_id' => $line->po_id, 'subject_id' => $line->subject_id])?->qty_received);
 
         // Stock: 4 + 6 = 10 into oh.atp.
         self::assertSame(10, $this->forSaleQty($sid));

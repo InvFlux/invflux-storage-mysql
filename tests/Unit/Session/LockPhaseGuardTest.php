@@ -54,7 +54,7 @@ final class LockPhaseGuardTest extends TestCase
      * The host table prefix must not hide an inventory lock — if it did, the guard would classify
      * the inventory read as an entity read and the ordering would be enforced backwards.
      */
-    public function testInventoryTableIsRecognisedUnderAnyHostPrefix(): void
+    public function testInventoryTableIsRecognizedUnderAnyHostPrefix(): void
     {
         foreach (['invflux_inventory_state', 'wp_invflux_inventory_state', 'wp_7_invflux_inventory_state'] as $table) {
             $guard = new LockPhaseGuard(new FakeMysqlSession());

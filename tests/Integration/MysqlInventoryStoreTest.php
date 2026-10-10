@@ -690,7 +690,7 @@ final class MysqlInventoryStoreTest extends TestCase
         self::assertSame('7', $row['actor_id']);
         self::assertSame('setting', $row['ref_type']);
         self::assertSame('1', (string) $row['ref_id']);
-        // Key order is not a property of the payload. MySQL's native JSON type normalises objects
+        // Key order is not a property of the payload. MySQL's native JSON type normalizes objects
         // on the way in, ordering keys by length and then bytes — so `{"from":0,"to":2}` comes
         // back as `{"to":2,"from":0}`. MariaDB stores JSON as LONGTEXT and preserves insertion
         // order, so an order-sensitive assertSame passed locally and failed on CI. Sorting makes
@@ -2023,7 +2023,7 @@ final class MysqlInventoryStoreTest extends TestCase
     public function testRegisterSubjectDefaultsToUngoverned(): void
     {
         // Governance is opt-in: registering a subject establishes its *identity*, and says
-        // nothing about whether InvFlux owns its stock. A catalogue sync can therefore register
+        // nothing about whether InvFlux owns its stock. A catalog sync can therefore register
         // everything it sees without silently enrolling it into inventory.
         $this->store()->bootstrap($this->baseDefinition());
 
@@ -3438,7 +3438,7 @@ final class MysqlInventoryStoreTest extends TestCase
         // The vacated code is a new, history-free node — same key, different slot.
         self::assertNotSame($freeSlotId, $this->slotIdForKey('fs.wh'));
 
-        // Retroactive relabelling is only truthful if it is recorded.
+        // Retroactive relabeling is only truthful if it is recorded.
         self::assertSame(1, $this->fetchCount(
             "SELECT COUNT(*) FROM invflux_schema_ledger WHERE event_type = 'location_hierarchised'",
         ));
@@ -3996,7 +3996,7 @@ final class MysqlInventoryStoreTest extends TestCase
     // -----------------------------------------------------------------------
     // resolveSurfaceId / resolveActorId — registry resolvers
     //
-    // The SELECT-first behaviour is what protects the SMALLINT auto-increment
+    // The SELECT-first behavior is what protects the SMALLINT auto-increment
     // domain on `wp_invflux_surfaces.id` (and other small-PK registry tables)
     // from being burnt by INSERT-then-collide on every call. These tests
     // verify the contract: existing rows are returned without writes, missing
@@ -4033,7 +4033,7 @@ final class MysqlInventoryStoreTest extends TestCase
         );
     }
 
-    public function testResolveSurfaceIdHonoursParentIdSetCorrectAndOmitSemantics(): void
+    public function testResolveSurfaceIdHonorsParentIdSetCorrectAndOmitSemantics(): void
     {
         $this->store()->bootstrap($this->baseDefinition());
 

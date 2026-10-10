@@ -23,6 +23,8 @@ use Nandan108\InvFlux\Domain\Procurement\PoStatus;
 use Nandan108\InvFlux\Domain\Procurement\PurchaseOrder;
 use Nandan108\InvFlux\Domain\Procurement\PurchaseOrderLine;
 use Nandan108\InvFlux\Domain\Procurement\PurchaseOrderRepository;
+use Nandan108\InvFlux\Domain\Procurement\ReceiptCorrection;
+use Nandan108\InvFlux\Domain\Procurement\ReceiptCorrectionLine;
 use Nandan108\InvFlux\Domain\Procurement\ReceiptLine;
 use Nandan108\InvFlux\Domain\Procurement\ReceivingSession;
 use Nandan108\InvFlux\Domain\Procurement\ReceivingSessionRepository;
@@ -76,12 +78,15 @@ use Nandan108\InvFlux\Util\Ulid;
  */
 final class MysqlDomainStore implements SupplierRepository, PurchaseOrderRepository, ReceivingSessionRepository, GoodsReceiptRepository, TermsRepository
 {
+    /** The largest place a purchase-order line can take: the `position` column is a SMALLINT UNSIGNED. */
+    private const MAX_LINE_POSITION = 65535;
+
     /** Memoized `purchase_order` registry id — see {@see purchaseOrderRefTypeId()}. */
     private ?int $purchaseOrderRefTypeId = null;
 
     /**
      * The cross-cutting identity registries: actor/surface/ref types and their instances,
-     * plus the identifier-type and system catalogues.
+     * plus the identifier-type and system catalogs.
      *
      * A **set**, not a sequence — creation order is derived from the declared foreign keys
      * by the schema installer. What position still governs here is {@see seedReferenceTables()},
@@ -107,7 +112,7 @@ final class MysqlDomainStore implements SupplierRepository, PurchaseOrderReposit
     ];
 
     /**
-     * The procurement domain: suppliers and their catalogue, purchase orders, goods receipts.
+     * The procurement domain: suppliers and their catalog, purchase orders, goods receipts.
      *
      * `Supplier` references `invflux_actors`, `SupplierProduct` references `invflux_suppliers`
      * and `invflux_subjects` — all resolved from the declarations, so this too is a set.
@@ -127,6 +132,9 @@ final class MysqlDomainStore implements SupplierRepository, PurchaseOrderReposit
         PurchaseOrderLine::class,
         GoodsReceipt::class,
         ReceiptLine::class,
+        // A correction FKs into the receipt, and its lines into the receipt's lines.
+        ReceiptCorrection::class,
+        ReceiptCorrectionLine::class,
         // Reception WIP. No foreign key of its own — it names its target document by the same
         // discriminated ref a receipt does, so it installs independently of what it points at.
         ReceivingSession::class,
@@ -154,7 +162,7 @@ final class MysqlDomainStore implements SupplierRepository, PurchaseOrderReposit
         SubjectWorksheetRecord::class,
         SubjectWorksheetItemRecord::class,
         SubjectStockConcern::class,
-        // The merchant's translations of the labels they typed, for every labelled entity at once
+        // The merchant's translations of the labels they typed, for every labeled entity at once
         // (tags today, locations and reason codes next). Polymorphic by `entity_key` and so
         // without a foreign key, like Annotation — position is free.
         LabelTranslation::class,
@@ -581,7 +589,7 @@ final class MysqlDomainStore implements SupplierRepository, PurchaseOrderReposit
      *  - **Exact match on the text and reference** — someone else interned the same terms
      *    concurrently. Their hash is the answer.
      *  - **The reference is held by different terms** — refused: moving it would print one
-     *    reference on two artefacts.
+     *    reference on two artifacts.
      *  - **Neither** — a key collision: different terms own the key these would take. The text is
      *    written again at its next {@see Terms::$attempt}, which moves its key somewhere unrelated,
      *    and the same terms interned later find the row by text before reaching the key at all.
@@ -589,7 +597,7 @@ final class MysqlDomainStore implements SupplierRepository, PurchaseOrderReposit
      * One path for every backend: an atomic upsert would need an engine-specific way to return the
      * row it landed on, and a path one engine never runs is a path nobody tests there.
      *
-     * Idempotent, and cheap to retry: re-interning the same artefact returns the same hash and
+     * Idempotent, and cheap to retry: re-interning the same artifact returns the same hash and
      * mints no row.
      */
     #[\Override]
@@ -1110,11 +1118,102 @@ final class MysqlDomainStore implements SupplierRepository, PurchaseOrderReposit
             return [];
         }
 
-        // One bulk INSERT for new lines, one deadlock-safe upsert for keyed ones; upsertAll()
-        // back-fills the generated ids onto the new records, so callers can use them.
+        // A line is keyed by its order and its product, both of which the caller sets, so a complete
+        // key is no evidence the row is new: upsertAll() coalesces on the whole key (insert-ignore,
+        // lock, update), which is one round trip per step for the whole set.
+        //
+        // That coalescing is also why a repeat is refused here first. Two lines for one product on one
+        // order in the same batch would not fail at the database: they would merge, the last one
+        // silently replacing the others. An order carries one line per product, and a batch that
+        // says otherwise is a caller error to report, not a set of figures to pick from.
+        $seen = [];
+        foreach ($lines as $line) {
+            $key = $line->po_id.':'.$line->subject_id;
+            if (isset($seen[$key])) {
+                throw new \InvalidArgumentException(sprintf(
+                    'Purchase order %d is given product %d twice; an order carries one line per product.',
+                    $line->po_id,
+                    $line->subject_id,
+                ));
+            }
+            $seen[$key] = true;
+        }
+        $this->assignLinePositions($lines);
         (new RecordSet($lines))->upsertAll();
 
         return $lines;
+    }
+
+    /**
+     * Give every line that has no place yet the next ones in its order, in the order given.
+     *
+     * A line's place is a sort key, not an identity: two lines that tie are ordered by product, so a
+     * concurrent add landing on the same number is harmless, and nothing here locks. One read for every
+     * order in the batch. The column is a SMALLINT, and a draft that is edited for long enough (lines
+     * added and removed, each add taking the next number) can approach its ceiling without holding many
+     * lines; WordPress does not run in strict mode, so an overflow would clamp rather than fail. Such an
+     * order is renumbered compactly, in its current order, before new places are handed out.
+     *
+     * @param list<PurchaseOrderLine> $lines
+     */
+    private function assignLinePositions(array $lines): void
+    {
+        $unplaced = [];
+        foreach ($lines as $line) {
+            if (0 === $line->position) {
+                $unplaced[$line->po_id][] = $line;
+            }
+        }
+        if ([] === $unplaced) {
+            return;
+        }
+
+        $session = $this->session ?? $this->connection->session;
+        $table = $this->table('invflux_po_lines');
+        $poIds = array_keys($unplaced);
+        $placeholders = implode(', ', array_fill(0, \count($poIds), '?'));
+        $max = [];
+        foreach ($session->fetchAll(
+            "SELECT po_id, MAX(position) AS mx FROM `{$table}` WHERE po_id IN ({$placeholders}) GROUP BY po_id",
+            $poIds,
+        ) as $row) {
+            $max[(int) $row['po_id']] = (int) $row['mx'];
+        }
+
+        foreach ($unplaced as $poId => $poLines) {
+            $next = $max[$poId] ?? 0;
+            if ($next + \count($poLines) > self::MAX_LINE_POSITION) {
+                $next = $this->compactLinePositions($poId);
+                if ($next + \count($poLines) > self::MAX_LINE_POSITION) {
+                    throw new \InvalidArgumentException(sprintf(
+                        'Purchase order %d cannot hold more than %d lines.',
+                        $poId,
+                        self::MAX_LINE_POSITION,
+                    ));
+                }
+            }
+            foreach ($poLines as $line) {
+                $line->position = ++$next;
+            }
+        }
+    }
+
+    /** Renumber an order's lines 1..n in their current order; returns n. */
+    private function compactLinePositions(int $poId): int
+    {
+        $session = $this->session ?? $this->connection->session;
+        $table = $this->table('invflux_po_lines');
+        $session->exec(
+            "UPDATE `{$table}` l
+               JOIN (SELECT po_id, subject_id,
+                            ROW_NUMBER() OVER (ORDER BY position, subject_id) AS rn
+                       FROM `{$table}` WHERE po_id = ?) r
+                 ON r.po_id = l.po_id AND r.subject_id = l.subject_id
+                SET l.position = r.rn",
+            [$poId],
+        );
+
+        return (int) $session->fetchScalar("SELECT COUNT(*) FROM `{$table}` WHERE po_id = ?", [$poId]);
     }
 
     #[\Override]
@@ -1127,7 +1226,7 @@ final class MysqlDomainStore implements SupplierRepository, PurchaseOrderReposit
     public function countOpenProcurementForSubject(SubjectId $subjectId): int
     {
         $session = $this->session ?? $this->connection->session;
-        // Open = any PO that is not a draft (in-prep), not cancelled, and not filed away: a
+        // Open = any PO that is not a draft (in-prep), not canceled, and not filed away: a
         // submitted / in-transit / in-reception / partially-received / received-but-not-closed PO
         // can still move quantity, so it blocks. Archiving is a column, not a status, so it needs
         // its own clause. Distinct PO count (a PO with two lines on the subject is one).
@@ -1139,7 +1238,7 @@ final class MysqlDomainStore implements SupplierRepository, PurchaseOrderReposit
                 $this->table('invflux_po_lines'),
                 $this->table('invflux_pos'),
                 PoStatus::InPrep->value,
-                PoStatus::Cancelled->value,
+                PoStatus::Canceled->value,
             ),
             [$subjectId->id],
         );
@@ -1165,7 +1264,7 @@ final class MysqlDomainStore implements SupplierRepository, PurchaseOrderReposit
     }
 
     #[\Override]
-    public function removeSubjectFromCatalogues(int $subjectId): int
+    public function removeSubjectFromCatalogs(int $subjectId): int
     {
         $session = $this->session ?? $this->connection->session;
 
@@ -1181,7 +1280,10 @@ final class MysqlDomainStore implements SupplierRepository, PurchaseOrderReposit
     #[\Override]
     public function linesForPurchaseOrder(int $poId): array
     {
-        return [...PurchaseOrderLine::where('po_id', $poId)];
+        // By their place in the order. The key is (po_id, subject_id), so without an ORDER BY the
+        // engine would hand them back by product id: the merchant's own sequence, scrambled. The
+        // product breaks a tie, which a place is allowed to have.
+        return [...PurchaseOrderLine::find('po_id = ?', [$poId], orderByLimit: 'ORDER BY position ASC, subject_id ASC')];
     }
 
     /**
@@ -1201,24 +1303,27 @@ final class MysqlDomainStore implements SupplierRepository, PurchaseOrderReposit
             (new RecordSet($lines))->upsertAll();
 
             // Bump every referenced PO line's app-maintained rollups (`qty_received` = good units,
-            // `qty_damaged` = damaged units) in bulk: accumulate the per-PO-line deltas, lock the lines
+            // `qty_damaged` = damaged units) in bulk: accumulate the per-line deltas, lock the lines
             // via LockSet (tier 34, ascending PK — re-entrant when ReceiveGoods already holds them),
             // apply the deltas in memory, and upsertAll() once. No per-line getOne/save loop. qty_open is
             // a generated column the DB recomputes from the new qty_received.
-            // A line with no ordered line behind it — a source-less intake — has no rollup to bump,
-            // and is skipped rather than defaulted. A null array key would silently become "" and
-            // send an id-shaped nothing into the lock below.
-            $receivedByPoLineId = [];
-            $damagedByPoLineId = [];
+            // A receipt line no purchase order backs — a source-less intake — has no rollup to bump,
+            // and is skipped rather than defaulted. Deltas are keyed by the line's whole key, the
+            // order and the product, since a receipt may count against several orders.
+            $received = [];
+            $damaged = [];
+            $keys = [];
             foreach ($lines as $line) {
-                if (null === $line->po_line_id) {
+                if (null === $line->po_id) {
                     continue;
                 }
-                $receivedByPoLineId[$line->po_line_id] = ($receivedByPoLineId[$line->po_line_id] ?? 0) + $line->qty;
-                $damagedByPoLineId[$line->po_line_id] = ($damagedByPoLineId[$line->po_line_id] ?? 0) + $line->damaged_qty;
+                $k = $line->po_id.':'.$line->subject_id;
+                $keys[$k] = ['po_id' => $line->po_id, 'subject_id' => $line->subject_id];
+                $received[$k] = ($received[$k] ?? 0) + $line->qty;
+                $damaged[$k] = ($damaged[$k] ?? 0) + $line->damaged_qty;
             }
 
-            if ([] !== $receivedByPoLineId) {
+            if ([] !== $keys) {
                 // LockSet builds the FOR UPDATE read, so it needs the dialect too. When this
                 // store was handed its own session, wrap it with the injected connection's
                 // dialect rather than falling back to the connection's session — the point of
@@ -1226,12 +1331,13 @@ final class MysqlDomainStore implements SupplierRepository, PurchaseOrderReposit
                 $connection = null !== $this->session
                     ? new Connection($this->session, $this->connection->dialect)
                     : $this->connection;
-                $locked = LockSet::acquire($connection, [PurchaseOrderLine::class => array_keys($receivedByPoLineId)]);
+                $locked = LockSet::acquire($connection, [PurchaseOrderLine::class => array_values($keys)]);
                 $poLines = $locked[PurchaseOrderLine::class];
                 foreach ($poLines as $poLine) {
                     /** @var PurchaseOrderLine $poLine */
-                    $poLine->qty_received += $receivedByPoLineId[(int) $poLine->id] ?? 0;
-                    $poLine->qty_damaged += $damagedByPoLineId[(int) $poLine->id] ?? 0;
+                    $k = $poLine->po_id.':'.$poLine->subject_id;
+                    $poLine->qty_received += $received[$k] ?? 0;
+                    $poLine->qty_damaged += $damaged[$k] ?? 0;
                 }
                 $poLines->upsertAll();
             }
@@ -1286,25 +1392,29 @@ final class MysqlDomainStore implements SupplierRepository, PurchaseOrderReposit
     }
 
     /**
-     * @param list<int> $poLineIds
+     * @param list<int> $subjectIds
      *
-     * @return array<int, list<SupplierInvoiceLine>>
+     * @return array<int, list<SupplierInvoiceLine>> keyed by subject id
      */
     #[\Override]
-    public function supplierInvoiceLinesForOrderLines(array $poLineIds): array
+    public function supplierInvoiceLinesForOrderLines(int $poId, array $subjectIds): array
     {
-        if ([] === $poLineIds) {
+        if ([] === $subjectIds) {
             return [];
         }
 
-        $placeholders = implode(', ', array_fill(0, \count($poLineIds), '?'));
-        $byOrderLine = [];
+        $placeholders = implode(', ', array_fill(0, \count($subjectIds), '?'));
+        $bySubject = [];
         // Ordered by id so "the latest document" means the same thing here as it does to the caller.
-        foreach (SupplierInvoiceLine::find("po_line_id IN ($placeholders)", $poLineIds, orderByLimit: 'ORDER BY id ASC') as $line) {
-            $byOrderLine[$line->po_line_id][] = $line;
+        foreach (SupplierInvoiceLine::find(
+            "po_id = ? AND subject_id IN ($placeholders)",
+            [$poId, ...$subjectIds],
+            orderByLimit: 'ORDER BY id ASC',
+        ) as $line) {
+            $bySubject[$line->subject_id][] = $line;
         }
 
-        return $byOrderLine;
+        return $bySubject;
     }
 
     /**
@@ -1375,6 +1485,12 @@ final class MysqlDomainStore implements SupplierRepository, PurchaseOrderReposit
         return ReceivingSession::getOne($id);
     }
 
+    #[\Override]
+    public function findReceivingSessionByOpenKey(string $openKey): ?ReceivingSession
+    {
+        return ReceivingSession::findOne('open_key = ?', [$openKey]);
+    }
+
     /**
      * @param list<int> $ids
      *
@@ -1411,6 +1527,41 @@ final class MysqlDomainStore implements SupplierRepository, PurchaseOrderReposit
                 max(1, $limit),
                 max(0, $offset),
             ),
+        )];
+    }
+
+    #[\Override]
+    public function findGoodsReceipt(int $id): ?GoodsReceipt
+    {
+        return GoodsReceipt::getOne($id);
+    }
+
+    #[\Override]
+    public function goodsReceiptLines(int $receiptId): array
+    {
+        return [...ReceiptLine::find('receipt_id = ?', [$receiptId], 'ORDER BY id')];
+    }
+
+    /** @return list<ReceiptCorrection> */
+    #[\Override]
+    public function receiptCorrections(int $receiptId): array
+    {
+        return [...ReceiptCorrection::find('receipt_id = ?', [$receiptId], 'ORDER BY id')];
+    }
+
+    /** @return list<ReceiptCorrectionLine> */
+    #[\Override]
+    public function receiptCorrectionLines(int $receiptId): array
+    {
+        $ids = array_map(static fn (ReceiptCorrection $c): int => (int) $c->id, $this->receiptCorrections($receiptId));
+        if ([] === $ids) {
+            return [];
+        }
+
+        return [...ReceiptCorrectionLine::find(
+            'correction_id IN ('.implode(', ', array_fill(0, \count($ids), '?')).')',
+            $ids,
+            'ORDER BY id',
         )];
     }
 
@@ -1634,7 +1785,7 @@ final class MysqlDomainStore implements SupplierRepository, PurchaseOrderReposit
             // Platform-internal identifier namespace (the InvFlux-minted side, parallel to
             // host systems like 'woo'): supplier SKUs/barcodes resolve here scoped per supplier
             // actor, and so do the host-neutral commercial identifiers (`sku`, `gtin`, the
-            // barcode family) — the codes a catalogue is matched on rather than addressed by.
+            // barcode family) — the codes a catalog is matched on rather than addressed by.
             // Host systems ('woo', …) are registered at runtime by adapters.
             SystemRecord::newWith(['slug' => SystemRecord::INVFLUX_SLUG, 'name' => 'InvFlux'])->save();
         }

@@ -25,7 +25,7 @@ use Nandan108\InvFlux\Exceptions\PersistenceException;
  * because the alternative, asking each locking call site to declare its phase, is one forgotten
  * call site away from a hole, and the call sites are extensible by add-ons.
  *
- * ## How a lock is recognised
+ * ## How a lock is recognized
  *
  * By inspecting SQL for `FOR UPDATE` and asking whether the statement touches the inventory-state
  * table. That is pattern-matching rather than a type, and it is a deliberate trade: it is the only
@@ -81,7 +81,7 @@ final class LockPhaseGuard implements MysqlSession
      *                                                                slipped lock order fails loudly and gets fixed. False in
      *                                                                production, where turning a *possible* deadlock into a
      *                                                                *certain* fatal would be the worse trade — there it records
-     *                                                                and lets the statement through, leaving behaviour exactly as
+     *                                                                and lets the statement through, leaving behavior exactly as
      *                                                                it was before this guard existed
      * @param (\Closure(string, string): void)|null $onViolation      receives (message, sql); wire it to a log in production,
      *                                                                where nothing else would surface the violation
