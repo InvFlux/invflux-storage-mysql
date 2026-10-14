@@ -8,10 +8,14 @@ use Nandan108\Attrecord\Connection;
 use Nandan108\Attrecord\Dialect\MysqlDialect;
 use Nandan108\Attrecord\Record as AttrecordRecord;
 use Nandan108\Attrecord\Session\PdoDbSession;
+use Nandan108\InvFlux\Application\Procurement\CloseShortReceipt;
 use Nandan108\InvFlux\Application\Procurement\CorrectReceipt;
 use Nandan108\InvFlux\Application\Procurement\ReceiptLineChange;
 use Nandan108\InvFlux\Application\Procurement\ReceiveGoods;
 use Nandan108\InvFlux\Domain\Procurement\GoodsReceipt;
+use Nandan108\InvFlux\Domain\Procurement\PoEvent;
+use Nandan108\InvFlux\Domain\Procurement\PoShortfall;
+use Nandan108\InvFlux\Domain\Procurement\PoStatus;
 use Nandan108\InvFlux\Domain\Procurement\ProcurementMovementType;
 use Nandan108\InvFlux\Domain\Procurement\PurchaseOrder;
 use Nandan108\InvFlux\Domain\Procurement\PurchaseOrderLine;
@@ -19,6 +23,9 @@ use Nandan108\InvFlux\Domain\Procurement\ReceiptCorrection;
 use Nandan108\InvFlux\Domain\Procurement\ReceiptCorrectionLine;
 use Nandan108\InvFlux\Domain\Procurement\ReceiptLine;
 use Nandan108\InvFlux\Domain\Procurement\ReceiptReason;
+use Nandan108\InvFlux\Domain\Procurement\ShortfallCapture;
+use Nandan108\InvFlux\Domain\Procurement\ShortfallCause;
+use Nandan108\InvFlux\Domain\Procurement\ShortfallPart;
 use Nandan108\InvFlux\Domain\Procurement\SubjectCost;
 use Nandan108\InvFlux\Domain\Procurement\Supplier;
 use Nandan108\InvFlux\Domain\Subject\Subject;
@@ -284,6 +291,81 @@ final class CorrectReceiptTest extends TestCase
 
     // ── fixtures ────────────────────────────────────────────────────────────────
 
+    /**
+     * The reads a document page and a receipts list stand on: an order finds its own receipts, and a
+     * list learns in one batched read which receipts were corrected and which were reversed.
+     */
+    public function testAnOrderListsItsReceiptsAndEachOnesCorrectionState(): void
+    {
+        $subjectId = $this->subject();
+        [$receipt, $line, $poLineKey] = $this->poReceipt($subjectId, 10, '10.0000', requested: 10);
+        $domain = $this->domainStore();
+
+        $forOrder = $domain->goodsReceiptsForSource($this->poRefTypeId(), $poLineKey['po_id']);
+        self::assertSame([(int) $receipt->id], array_map(static fn (GoodsReceipt $r): int => (int) $r->id, $forOrder));
+        self::assertSame([], $domain->correctedReceiptTotals([(int) $receipt->id]), 'an uncorrected receipt has no corrected totals');
+
+        $correct = $this->correct();
+        $correct((int) $receipt->id, [new ReceiptLineChange((int) $line->id, 4, 1, '10.0000')], new ActorReference('admin', '1'), self::LOC);
+        self::assertSame([(int) $receipt->id => ['qty' => 4, 'damaged' => 1]], $domain->correctedReceiptTotals([(int) $receipt->id]));
+
+        // The order's timeline shows the correction, and which receipt it opens.
+        $events = PoEvent::find('po_id = ? AND event_type = ?', [$poLineKey['po_id'], PoEvent::TYPE_RECEIPT_CORRECTED]);
+        self::assertCount(1, $events);
+        /** @var array{receiptId: int, reverses: bool, lines: list<array{subjectId: int, qty: int, damaged: int}>} $payload */
+        $payload = json_decode((string) $events[0]->payload, true, 512, JSON_THROW_ON_ERROR);
+        self::assertSame((int) $receipt->id, $payload['receiptId']);
+        self::assertFalse($payload['reverses']);
+        self::assertSame([['subjectId' => $subjectId, 'qty' => -6, 'damaged' => 1]], $payload['lines']);
+
+        // The latest correction of a line is what it stands at.
+        $correct((int) $receipt->id, [new ReceiptLineChange((int) $line->id, 0, 0, '10.0000')], new ActorReference('admin', '1'), self::LOC);
+        self::assertSame([(int) $receipt->id => ['qty' => 0, 'damaged' => 0]], $domain->correctedReceiptTotals([(int) $receipt->id]));
+        self::assertSame([], $domain->correctedReceiptTotals([]));
+    }
+
+    /**
+     * A close-short writes off the open remainder and records why in the same transaction: one row
+     * per part, pointing at the close's event, adding up to what was written off.
+     */
+    public function testACloseShortRecordsItsShortfallWithTheClose(): void
+    {
+        $subjectId = $this->subject();
+        [$receipt, $line, $poLineKey] = $this->poReceipt($subjectId, 6, '10.0000', requested: 10);
+        $domain = $this->domainStore();
+        $po = $domain->findPurchaseOrder($poLineKey['po_id']);
+        self::assertNotNull($po);
+        $po->status = PoStatus::InReception;
+        $domain->savePurchaseOrder($po);
+        $lines = $domain->linesForPurchaseOrder((int) $po->id);
+        // The supplier had confirmed 8 of the 10: of the 4 open, 2 were never confirmed.
+        $lines[0]->qty_expected = 8;
+
+        (new CloseShortReceipt($domain))($po, $lines, 1, capture: new ShortfallCapture(
+            parts: [
+                ShortfallPart::Unconfirmed->value => ['cause' => ShortfallCause::OutOfStock],
+                ShortfallPart::Undelivered->value => ['cause' => ShortfallCause::ShippedShort],
+            ],
+            note: 'two cartons short',
+        ));
+
+        $rows = $domain->shortfallsForPurchaseOrder((int) $po->id);
+        self::assertSame(
+            [['unconfirmed', 2, 'out_of_stock'], ['undelivered', 2, 'shipped_short']],
+            array_map(static fn (PoShortfall $r): array => [$r->part->value, $r->qty, $r->cause->value], $rows),
+        );
+        $event = [...PoEvent::find('po_id = ? AND event_type = ?', [(int) $po->id, PoEvent::TYPE_SHORT_CLOSED])][0] ?? null;
+        self::assertNotNull($event);
+        foreach ($rows as $row) {
+            self::assertSame((int) $event->id, $row->event_id);
+            self::assertSame('two cartons short', $row->note);
+        }
+        $after = $domain->linesForPurchaseOrder((int) $po->id);
+        self::assertSame(4, $after[0]->qty_closed_short);
+        self::assertSame(0, $after[0]->qty_open);
+        unset($receipt, $line);
+    }
+
     private function subject(): int
     {
         $subject = Subject::newWith(['kind' => SubjectKind::Unit, 'ivfx_governed' => true]);
@@ -300,6 +382,34 @@ final class CorrectReceiptTest extends TestCase
             new ActorReference('admin', '1'),
             self::LOC,
         );
+    }
+
+    /**
+     * The rate a new receipt in a currency is offered: the latest one recorded against an order in
+     * that currency, whichever supplier it came from; none for a currency never received.
+     */
+    public function testTheLastRateRecordedForACurrencyIsOffered(): void
+    {
+        $domain = $this->domainStore();
+        $receiptIn = function (string $currency, ?string $rate, string $at) use ($domain): void {
+            $supplier = $domain->createSupplier(Supplier::newWith(['name' => "FX {$currency} {$at}", 'default_currency' => $currency]));
+            $po = $domain->createPurchaseOrder(PurchaseOrder::newWith(['supplier_id' => $supplier->id, 'currency' => $currency]));
+            GoodsReceipt::newWith([
+                'source_ref_type_id' => $this->poRefTypeId(),
+                'source_id'          => $po->id,
+                'fx_rate'            => $rate,
+                'received_at'        => new \DateTimeImmutable($at),
+            ])->save();
+        };
+        $receiptIn('SEK', '0.08700000', '2026-10-01 10:00:00');
+        $receiptIn('SEK', '0.08800000', '2026-10-05 10:00:00');
+        $receiptIn('SEK', null, '2026-10-07 10:00:00');      // recorded with no rate: not an answer
+        $receiptIn('USD', '0.92000000', '2026-10-06 10:00:00');
+
+        self::assertSame('0.08800000', $domain->lastFxRateForCurrency('SEK', $this->poRefTypeId()));
+        self::assertSame('0.08800000', $domain->lastFxRateForCurrency('sek', $this->poRefTypeId()));
+        self::assertSame('0.92000000', $domain->lastFxRateForCurrency('USD', $this->poRefTypeId()));
+        self::assertNull($domain->lastFxRateForCurrency('CHF', $this->poRefTypeId()));
     }
 
     /** @return array{GoodsReceipt, ReceiptLine, array{po_id: int, subject_id: int}} */
@@ -416,7 +526,7 @@ final class CorrectReceiptTest extends TestCase
         $tables = [
             'invflux_idempotency',
             'invflux_receipt_correction_lines', 'invflux_receipt_corrections',
-            'invflux_po_events', 'invflux_receipt_lines', 'invflux_goods_receipts',
+            'invflux_po_shortfalls', 'invflux_po_events', 'invflux_receipt_lines', 'invflux_goods_receipts',
             'invflux_po_lines', 'invflux_pos', 'invflux_document_parties', 'invflux_po_number_counters',
             'invflux_subject_cost_metadata', 'invflux_supplier_products', 'invflux_suppliers',
             'invflux_subject_worksheet_items', 'invflux_subject_worksheets',

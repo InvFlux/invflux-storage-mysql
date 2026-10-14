@@ -6284,7 +6284,6 @@ final class MysqlInventoryStore implements InventoryStore
             $policy = $this->loadIdentifierPolicy($systemId, $typeId, $scopeActorTypeId);
             $scopeActorKey = $scopeActorId ?? 0;
             $now = new \DateTimeImmutable();
-            $openEnded = IdentifierValidity::OPEN_ENDED;
 
             // Lock existing rows for this (system, type, scope, value)
             $existingRows = $this->fetchAllRows(
@@ -6302,7 +6301,7 @@ final class MysqlInventoryStore implements InventoryStore
 
             foreach ($existingRows as $row) {
                 $rowSubjectId = (int) $row['subject_id'];
-                $isActive = (string) $row['valid_to'] === $openEnded;
+                $isActive = IdentifierValidity::isOpenEnded((string) $row['valid_to']);
 
                 if ($rowSubjectId === $subjectId->id && $isActive) {
                     // Same subject already owns this active identifier — idempotent.
@@ -6388,7 +6387,6 @@ final class MysqlInventoryStore implements InventoryStore
             $policy = $this->loadIdentifierPolicy($systemId, $typeId, $scopeActorTypeId);
             $scopeActorKey = $scopeActorId ?? 0;
             $now = new \DateTimeImmutable();
-            $openEnded = IdentifierValidity::OPEN_ENDED;
 
             /** @var list<string> $values */
             $values = array_values(array_unique(array_map(
@@ -6423,7 +6421,7 @@ final class MysqlInventoryStore implements InventoryStore
             foreach ($existingRows as $row) {
                 $byValue[(string) $row['value']][] = [
                     'subject_id' => (int) $row['subject_id'],
-                    'active'     => (string) $row['valid_to'] === $openEnded,
+                    'active'     => IdentifierValidity::isOpenEnded((string) $row['valid_to']),
                 ];
             }
 
@@ -6492,12 +6490,11 @@ final class MysqlInventoryStore implements InventoryStore
             [$typeId, $systemId, $scopeActorId] = $this->resolveIdentifierLookups($typeCode, $systemSlug, $scopeActor);
             $scopeActorKey = $scopeActorId ?? 0;
             $validTo ??= new \DateTimeImmutable();
-            $openEnded = IdentifierValidity::OPEN_ENDED;
 
             return SubjectIdentifier::updateWhere(
                 ['valid_to' => $validTo],
-                'system_id = ? AND type_id = ? AND scope_actor_key = ? AND value = ? AND valid_to = ?',
-                [$systemId, $typeId, $scopeActorKey, $value, $openEnded],
+                'system_id = ? AND type_id = ? AND scope_actor_key = ? AND value = ? AND valid_to >= ?',
+                [$systemId, $typeId, $scopeActorKey, $value, IdentifierValidity::OPEN_ENDED_FLOOR],
             );
         });
     }
@@ -6516,13 +6513,12 @@ final class MysqlInventoryStore implements InventoryStore
             $changedAt ??= new \DateTimeImmutable();
             [$typeId, $systemId, $scopeActorId] = $this->resolveIdentifierLookups($typeCode, $systemSlug, $scopeActor);
             $scopeActorKey = $scopeActorId ?? 0;
-            $openEnded = IdentifierValidity::OPEN_ENDED;
 
             // Expire old value for this subject
             $expired = SubjectIdentifier::updateWhere(
                 ['valid_to' => $changedAt],
-                'subject_id = ? AND system_id = ? AND type_id = ? AND scope_actor_key = ? AND value = ? AND valid_to = ?',
-                [$subjectId->id, $systemId, $typeId, $scopeActorKey, $oldValue, $openEnded],
+                'subject_id = ? AND system_id = ? AND type_id = ? AND scope_actor_key = ? AND value = ? AND valid_to >= ?',
+                [$subjectId->id, $systemId, $typeId, $scopeActorKey, $oldValue, IdentifierValidity::OPEN_ENDED_FLOOR],
             );
 
             if (0 === $expired) {
@@ -6549,7 +6545,6 @@ final class MysqlInventoryStore implements InventoryStore
         $this->session->transactional(function () use ($subjectId, $typeCode, $systemSlug, $value, $scopeActor): void {
             [$typeId, $systemId, $scopeActorId] = $this->resolveIdentifierLookups($typeCode, $systemSlug, $scopeActor);
             $scopeActorKey = $scopeActorId ?? 0;
-            $openEnded = IdentifierValidity::OPEN_ENDED;
             $now = new \DateTimeImmutable();
 
             // Check uniqueActiveValue — still enforced
@@ -6558,11 +6553,11 @@ final class MysqlInventoryStore implements InventoryStore
                     'SELECT subject_id FROM %s
                      WHERE system_id = :system_id AND type_id = :type_id
                        AND scope_actor_key = :scope_key AND value = :value
-                       AND valid_to = :open_ended
+                       AND valid_to >= :open_ended_floor
                      LIMIT 1',
                     $this->table(self::TABLE_SUBJECT_IDENTIFIERS),
                 ),
-                ['system_id' => $systemId, 'type_id' => $typeId, 'scope_key' => $scopeActorKey, 'value' => $value, 'open_ended' => $openEnded],
+                ['system_id' => $systemId, 'type_id' => $typeId, 'scope_key' => $scopeActorKey, 'value' => $value, 'open_ended_floor' => IdentifierValidity::OPEN_ENDED_FLOOR],
             );
 
             if (is_array($activeRow)) {
@@ -6604,10 +6599,10 @@ final class MysqlInventoryStore implements InventoryStore
             // concurrent claim on $from can neither be swept along nor half-moved.
             $rows = $this->fetchAllRows(
                 sprintf(
-                    'SELECT id FROM %s WHERE subject_id = :from_id AND valid_to = :open_ended FOR UPDATE',
+                    'SELECT id FROM %s WHERE subject_id = :from_id AND valid_to >= :open_ended_floor FOR UPDATE',
                     $this->table(self::TABLE_SUBJECT_IDENTIFIERS),
                 ),
-                ['from_id' => $from->id, 'open_ended' => $openEnded],
+                ['from_id' => $from->id, 'open_ended_floor' => IdentifierValidity::OPEN_ENDED_FLOOR],
             );
             $ids = array_map(static fn (array $row): int => (int) $row['id'], $rows);
             if ([] === $ids) {
@@ -6660,11 +6655,11 @@ final class MysqlInventoryStore implements InventoryStore
         // the one whose tenure ended last. JOIN on subjects for the kind filter (multi-table read —
         // sanctioned raw-SQL shape).
         $params = [
-            'system_id'  => $systemId,
-            'type_id'    => $typeId,
-            'scope_key'  => $scopeActorKey,
-            'value'      => $value,
-            'open_ended' => IdentifierValidity::OPEN_ENDED,
+            'system_id'        => $systemId,
+            'type_id'          => $typeId,
+            'scope_key'        => $scopeActorKey,
+            'value'            => $value,
+            'open_ended_floor' => IdentifierValidity::OPEN_ENDED_FLOOR,
         ];
         $kindClause = '';
         if (null !== $ofKind) {
@@ -6681,7 +6676,7 @@ final class MysqlInventoryStore implements InventoryStore
                     AND si.type_id = :type_id
                     AND si.scope_actor_key = :scope_key
                     AND si.value = :value
-                    AND si.valid_to <> :open_ended%s
+                    AND si.valid_to < :open_ended_floor%s
                   ORDER BY si.valid_to DESC
                   LIMIT 1',
                 $this->table(self::TABLE_SUBJECT_IDENTIFIERS),

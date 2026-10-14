@@ -2373,6 +2373,57 @@ final class MysqlInventoryStoreTest extends TestCase
         self::assertNull($this->store()->resolveExpiredIdentifierSubject('woo_post_id', 'woo', 'never-assigned'));
     }
 
+    /**
+     * A store that keeps no fractional seconds (WordPress Playground's SQLite translator) holds the
+     * open-ended sentinel as `9999-12-31 23:59:59`, which never equals the sentinel as written.
+     * MySQL reproduces that stored form exactly when the row is set without a fraction, so every
+     * open-ended test is pinned here against it: claiming (idempotent and conflicting), replacing,
+     * expiring, migrating, and resolving a prior holder.
+     */
+    public function testOpenEndedRowsStoredWithoutAFractionStillCountAsActive(): void
+    {
+        $this->store()->bootstrap($this->baseDefinition());
+        $this->store()->registerSystem('woo', 'WooCommerce');
+        $this->store()->registerIdentifierType('sku', 'SKU', 'internal');
+        $this->store()->registerIdentifierType('woo_post_id', 'WooCommerce Post ID', 'internal');
+        // The domain's uniqueness guard reads the live row, so it is the path under test here.
+        $this->store()->configureIdentifierAssignment('woo', 'sku', new IdentifierAssignmentPolicy(uniqueActiveValue: true));
+
+        $holder = $this->store()->registerSubject(kind: SubjectKind::Unit);
+        $other = $this->store()->registerSubject(kind: SubjectKind::Unit);
+        $this->store()->claimIdentifier($holder, 'sku', 'woo', 'SKU-A');
+        $this->store()->claimIdentifier($holder, 'sku', 'woo', 'SKU-B');
+        $this->store()->claimIdentifier($holder, 'woo_post_id', 'woo', '901', isPrimary: true);
+        $this->pdo()->exec("UPDATE invflux_subject_identifiers SET valid_to = '9999-12-31 23:59:59'");
+
+        // Claiming again for the holder is idempotent; for anyone else it conflicts.
+        $this->store()->claimIdentifier($holder, 'sku', 'woo', 'SKU-A');
+        try {
+            $this->store()->claimIdentifier($other, 'sku', 'woo', 'SKU-A');
+            self::fail('a live assignment stored without a fraction must still block a second claim');
+        } catch (IdentifierAlreadyClaimedException) {
+        }
+
+        // The live holder is never reported as a prior holder.
+        self::assertNull($this->store()->resolveExpiredIdentifierSubject('sku', 'woo', 'SKU-A'));
+
+        // Replacing finds the live row to retire.
+        $this->store()->replaceSubjectIdentifier($holder, 'sku', 'woo', 'SKU-B', 'SKU-B2');
+        self::assertEquals($holder, $this->store()->resolveIdentifier('sku', 'woo', 'SKU-B2'));
+        self::assertNull($this->store()->resolveIdentifier('sku', 'woo', 'SKU-B'));
+
+        // Expiring finds it too.
+        self::assertSame(1, $this->store()->expireIdentifier('sku', 'woo', 'SKU-A'));
+        self::assertNull($this->store()->resolveIdentifier('sku', 'woo', 'SKU-A'));
+        self::assertEquals($holder, $this->store()->resolveExpiredIdentifierSubject('sku', 'woo', 'SKU-A'));
+
+        // Migration moves the live rows and nothing else.
+        $this->pdo()->exec("UPDATE invflux_subject_identifiers SET valid_to = '9999-12-31 23:59:59' WHERE valid_to >= '9999-01-01'");
+        self::assertSame(2, $this->store()->migrateActiveIdentifiers($holder, $other));
+        self::assertEquals($other, $this->store()->resolveIdentifier('woo_post_id', 'woo', '901'));
+        self::assertEquals($other, $this->store()->resolveIdentifier('sku', 'woo', 'SKU-B2'));
+    }
+
     public function testRetypeSubjectRewritesTheSelfReferentialFkShape(): void
     {
         $this->store()->bootstrap($this->baseDefinition());

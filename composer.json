@@ -1,6 +1,6 @@
 {
     "name": "nandan108/invflux-storage-mysql",
-    "version": "0.2.0",
+    "version": "0.3.0",
     "description": "A persistence layer for InvFlux.",
     "type": "library",
     "license": [
@@ -20,7 +20,7 @@
     "require": {
         "php": "^8.1",
         "ext-json": "*",
-        "nandan108/invflux-core": "^0.2",
+        "nandan108/invflux-core": "^0.3",
         "nandan108/slot-flow": "^0.3",
         "nandan108/attrecord": "^0.24"
     },

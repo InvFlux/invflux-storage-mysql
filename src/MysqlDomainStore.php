@@ -19,6 +19,7 @@ use Nandan108\InvFlux\Domain\Procurement\GoodsReceiptRepository;
 use Nandan108\InvFlux\Domain\Procurement\PoEvent;
 use Nandan108\InvFlux\Domain\Procurement\PoNumberCounter;
 use Nandan108\InvFlux\Domain\Procurement\PoNumberScheme;
+use Nandan108\InvFlux\Domain\Procurement\PoShortfall;
 use Nandan108\InvFlux\Domain\Procurement\PoStatus;
 use Nandan108\InvFlux\Domain\Procurement\PurchaseOrder;
 use Nandan108\InvFlux\Domain\Procurement\PurchaseOrderLine;
@@ -149,6 +150,8 @@ final class MysqlDomainStore implements SupplierRepository, PurchaseOrderReposit
         TermsVersion::class,
         PoNumberCounter::class,
         PoEvent::class,
+        // A close-short's shortfall FKs into the order and into the close's event, so it follows both.
+        PoShortfall::class,
     ];
 
     /**
@@ -508,6 +511,37 @@ final class MysqlDomainStore implements SupplierRepository, PurchaseOrderReposit
 
             return $po;
         });
+    }
+
+    /**
+     * @param list<PurchaseOrderLine> $lines
+     * @param list<PoShortfall>       $shortfalls
+     */
+    #[\Override]
+    public function closePurchaseOrderShort(PurchaseOrder $po, array $lines, PoEvent $event, array $shortfalls): PurchaseOrder
+    {
+        // The written-off lines, the finalizing transition, its event and the shortfall it records
+        // commit together: a close whose reasons were lost would leave quantities nobody can explain.
+        return $this->transactional(function () use ($po, $lines, $event, $shortfalls): PurchaseOrder {
+            if ([] !== $lines) {
+                $this->savePurchaseOrderLines($lines);
+            }
+            $po->save();
+            $event->save();
+            foreach ($shortfalls as $shortfall) {
+                $shortfall->event_id = (int) $event->id;
+                $shortfall->save();
+            }
+
+            return $po;
+        });
+    }
+
+    /** @return list<PoShortfall> */
+    #[\Override]
+    public function shortfallsForPurchaseOrder(int $poId): array
+    {
+        return [...PoShortfall::find('po_id = ?', [$poId], 'ORDER BY id')];
     }
 
     #[\Override]
@@ -1563,6 +1597,88 @@ final class MysqlDomainStore implements SupplierRepository, PurchaseOrderReposit
             $ids,
             'ORDER BY id',
         )];
+    }
+
+    /** @return list<GoodsReceipt> */
+    #[\Override]
+    public function goodsReceiptsForSource(int $sourceRefTypeId, int $sourceId): array
+    {
+        return [...GoodsReceipt::find(
+            'source_ref_type_id = ? AND source_id = ?',
+            [$sourceRefTypeId, $sourceId],
+            'ORDER BY received_at ASC, id ASC',
+        )];
+    }
+
+    /**
+     * Raw SQL for a two-table read — a receipt does not carry its order's currency, so the order is
+     * joined for it.
+     */
+    #[\Override]
+    public function lastFxRateForCurrency(string $currency, int $poRefTypeId): ?string
+    {
+        $session = $this->session ?? $this->connection->session;
+        $rows = $session->fetchAll(
+            sprintf(
+                'SELECT gr.fx_rate
+                   FROM `%s` gr
+                   JOIN `%s` po ON po.id = gr.source_id
+                  WHERE gr.source_ref_type_id = ? AND po.currency = ? AND gr.fx_rate IS NOT NULL
+                  ORDER BY gr.received_at DESC, gr.id DESC
+                  LIMIT 1',
+                $this->table('invflux_goods_receipts'),
+                $this->table('invflux_pos'),
+            ),
+            [$poRefTypeId, strtoupper($currency)],
+        );
+        /** @psalm-var mixed $rate */
+        $rate = $rows[0]['fx_rate'] ?? null;
+
+        return is_numeric($rate) ? (string) $rate : null;
+    }
+
+    /**
+     * Three single-table reads for the whole set, never one per receipt: the corrections, their
+     * lines, and the corrected receipts' own lines — a line never corrected keeps its posted figures,
+     * so it has to be read to total the receipt as it stands.
+     *
+     * @param list<int> $receiptIds
+     *
+     * @return array<int, array{qty: int, damaged: int}>
+     */
+    #[\Override]
+    public function correctedReceiptTotals(array $receiptIds): array
+    {
+        $ids = array_values(array_unique($receiptIds));
+        if ([] === $ids) {
+            return [];
+        }
+        $marks = static fn (array $list): string => implode(', ', array_fill(0, \count($list), '?'));
+
+        $receiptOf = [];
+        foreach (ReceiptCorrection::find('receipt_id IN ('.$marks($ids).')', $ids) as $correction) {
+            $receiptOf[(int) $correction->id] = $correction->receipt_id;
+        }
+        if ([] === $receiptOf) {
+            return [];
+        }
+
+        // The last correction line per receipt line holds that line's current figures.
+        $correctionIds = array_keys($receiptOf);
+        $current = [];
+        foreach (ReceiptCorrectionLine::find('correction_id IN ('.$marks($correctionIds).')', $correctionIds, 'ORDER BY id') as $line) {
+            $current[$line->receipt_line_id] = [$line->qty_after, $line->damaged_after];
+        }
+
+        $corrected = array_values(array_unique($receiptOf));
+        $totals = array_fill_keys($corrected, ['qty' => 0, 'damaged' => 0]);
+        foreach (ReceiptLine::find('receipt_id IN ('.$marks($corrected).')', $corrected) as $line) {
+            [$qty, $damaged] = $current[(int) $line->id] ?? [$line->qty, $line->damaged_qty];
+            $totals[$line->receipt_id]['qty'] += $qty;
+            $totals[$line->receipt_id]['damaged'] += $damaged;
+        }
+
+        return $totals;
     }
 
     /**
