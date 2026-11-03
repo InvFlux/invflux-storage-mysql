@@ -316,7 +316,13 @@ final class CorrectReceiptTest extends TestCase
         $payload = json_decode((string) $events[0]->payload, true, 512, JSON_THROW_ON_ERROR);
         self::assertSame((int) $receipt->id, $payload['receiptId']);
         self::assertFalse($payload['reverses']);
-        self::assertSame([['subjectId' => $subjectId, 'qty' => -6, 'damaged' => 1]], $payload['lines']);
+        // Key order is the server's: MySQL's JSON type stores object keys sorted, MariaDB as written.
+        $lines = array_map(static function (array $l): array {
+            ksort($l);
+
+            return $l;
+        }, $payload['lines']);
+        self::assertSame([['damaged' => 1, 'qty' => -6, 'subjectId' => $subjectId]], $lines);
 
         // The latest correction of a line is what it stands at.
         $correct((int) $receipt->id, [new ReceiptLineChange((int) $line->id, 0, 0, '10.0000')], new ActorReference('admin', '1'), self::LOC);
