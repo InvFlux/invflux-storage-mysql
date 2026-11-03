@@ -66,6 +66,7 @@ use Nandan108\SlotFlow\MovementEngine;
 use Nandan108\SlotFlow\MovementResult;
 use Nandan108\SlotFlow\Results\MovementEvent;
 use Nandan108\SlotFlow\SlotSpace;
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 
 /** @extends QuantityStateBatch<string> */
@@ -195,20 +196,7 @@ final class MysqlInventoryStoreTest extends TestCase
     #[\Override]
     protected function setUp(): void
     {
-        $this->pdo = new \PDO(
-            sprintf(
-                'mysql:host=%s;port=%s;dbname=%s;charset=utf8mb4',
-                $this->env('INVFLOW_DB_HOST', '127.0.0.1'),
-                $this->env('INVFLOW_DB_PORT', '33067'),
-                $this->env('INVFLOW_DB_NAME', 'invflux_test'),
-            ),
-            $this->env('INVFLOW_DB_USER', 'invflux'),
-            $this->env('INVFLOW_DB_PASS', 'invflux'),
-            [
-                \PDO::ATTR_ERRMODE            => \PDO::ERRMODE_EXCEPTION,
-                \PDO::ATTR_DEFAULT_FETCH_MODE => \PDO::FETCH_ASSOC,
-            ],
-        );
+        $this->pdo = $this->connect();
 
         $session = new PdoMysqlSession($this->pdo);
         $this->store = new MysqlInventoryStore($session);
@@ -1098,6 +1086,70 @@ final class MysqlInventoryStoreTest extends TestCase
         ], $this->quantitiesByState($this->store()->inventoryBalances($subjectQ2)));
     }
 
+    /** @return iterable<string, array{int, int, int}> seeded `fs`, requested, what the movement then moves */
+    public static function rivalDrainsDuringPlanning(): iterable
+    {
+        yield 'the last unit goes to the rival' => [1, 1, 0];
+        yield 'the movement takes what is left' => [3, 3, 2];
+    }
+
+    /**
+     * Two checkouts for the same stock: the rival reserves a unit after this movement has read the
+     * balance and before it takes its locks, so the plan asks for more than the slot now holds.
+     *
+     * The quantity resolver runs in exactly that window (after the planning read, before
+     * persistBatch() locks), which makes the interleaving deterministic on two plain connections.
+     * The stale plan must neither reach the database as an unsigned out-of-range error nor be
+     * written: the movement is planned again from the drained balance and moves what is there.
+     */
+    #[DataProvider('rivalDrainsDuringPlanning')]
+    public function testExecuteBatchFlowFromStoragePlansAgainWhenARivalDrainsTheSourceMidPlan(
+        int $seeded,
+        int $requested,
+        int $moved,
+    ): void {
+        $this->store()->bootstrap($this->baseDefinition());
+        $this->store()->registerMovementTypes('InFlow', [
+            new MovementTypeDefinition('RSRV', 'Reservation'),
+        ]);
+        $subject = $this->subject('SKU-CONTENDED');
+        $this->insertInventoryState($subject, ['fs' => $seeded, 'res' => 0, 'sd' => 0]);
+
+        $reserve = Flow::define('reserve', static fn (Flow $flow) => $flow->move('fs', 'res'));
+        $rival = new MysqlInventoryStore(new PdoMysqlSession($this->connect()));
+        $plans = 0;
+
+        $persisted = $this->store()->executeBatchFlowFromStorage(new StorageBatchFlowRequest(
+            movementTypeOwnerKey: 'InFlow',
+            movementTypeCode: 'RSRV',
+            flow: $reserve,
+            subjectIds: [$subject],
+            slotFilters: ['state' => 'fs'],
+            quantityResolver: static function () use (&$plans, $rival, $reserve, $subject, $requested): int {
+                if (1 === ++$plans) {
+                    $rival->executeBatchFlowFromStorage(new StorageBatchFlowRequest(
+                        movementTypeOwnerKey: 'InFlow',
+                        movementTypeCode: 'RSRV',
+                        flow: $reserve,
+                        subjectIds: [$subject],
+                        slotFilters: ['state' => 'fs'],
+                        quantitiesBySubjectId: [$subject->id => 1],
+                    ));
+                }
+
+                return $requested;
+            },
+        ));
+
+        self::assertTrue($persisted->ok);
+        self::assertSame(2, $plans, 'the movement is planned again, from the balance the rival left');
+        self::assertSame([
+            'fs'  => (string) ($seeded - 1 - $moved),
+            'res' => (string) (1 + $moved),
+            'sd'  => '0',
+        ], $this->quantitiesByState($this->store()->inventoryBalances($subject)));
+    }
+
     /**
      * A flow may be named instead of built — and the name has to resolve against the definition the
      * adapter **bootstrapped**, because flows are code and are never persisted: the schema rebuilt
@@ -1655,6 +1707,60 @@ final class MysqlInventoryStoreTest extends TestCase
             'res' => '0',
             'sd'  => '0',
         ], $this->quantitiesByState($this->store()->inventoryBalances($subjectBatchConflict)));
+        self::assertSame(0, $this->fetchCount('SELECT COUNT(*) FROM invflux_inventory_ledger'));
+    }
+
+    /**
+     * A movement planned from balances that have since moved, with no guard armed: the plan takes
+     * 3 from a slot that now holds 1. Quantities are unsigned, so that row is a `min_quantity`
+     * conflict against a floor of 0, and the whole batch writes nothing — the subject whose stock
+     * was still there included. Two subjects, so this runs the staged multi-subject path.
+     */
+    public function testPersistBatchTreatsADecrementBelowZeroAsAConflictWithoutAGuard(): void
+    {
+        $definition = $this->baseDefinition();
+        $this->store()->bootstrap($definition);
+        $this->store()->registerMovementTypes('InFlow', [
+            new MovementTypeDefinition('RSRV', 'Reservation'),
+        ]);
+
+        $slotSpace = $definition->toSlotSpace();
+        $slotSpace->subjectKeyResolver(static fn (SubjectId $subject): string => (string) $subject->id);
+        $intact = $this->subject('SKU-STALE-INTACT');
+        $drained = $this->subject('SKU-STALE-DRAINED');
+        $this->insertInventoryState($intact, ['fs' => 5, 'res' => 0, 'sd' => 0]);
+        $this->insertInventoryState($drained, ['fs' => 1, 'res' => 0, 'sd' => 0]);
+
+        // What the plan believed: both subjects at 5.
+        $batch = QuantityStateBatch::fromRows(
+            space: $slotSpace,
+            rows: [$intact, $drained],
+            subjectGetter: static fn (SubjectId $subject): SubjectId => $subject,
+            slotRowGetter: static fn (SubjectId $_): array => [[['state' => 'fs'], 5], [['state' => 'res'], 0]],
+            quantityGetter: static fn (array $_): int => 3,
+        );
+        $batch = (new BatchMovementEngine(new MovementEngine()))->execute(
+            batch: $batch,
+            space: $slotSpace,
+            flow: Flow::define('reserve', static fn (Flow $flow) => $flow->move('fs', 'res')),
+        );
+
+        $persisted = $this->store()->persistBatch(new PersistBatchMovement(
+            movementBatch: $batch,
+            subjectIdResolver: static fn (SubjectId $subject): SubjectId => $subject,
+            movementTypeOwnerKey: 'InFlow',
+            movementTypeCode: 'RSRV',
+        ));
+
+        self::assertFalse($persisted->ok);
+        self::assertSame(0, $persisted->insertedLedgerRows);
+        self::assertCount(1, $persisted->conflicts);
+        self::assertSame('min_quantity', $persisted->conflicts[0]->reason);
+        self::assertSame($drained->id, $persisted->conflicts[0]->subjectId->id);
+        self::assertSame('-2', $persisted->conflicts[0]->projectedQuantity);
+        self::assertSame('0', $persisted->conflicts[0]->minQuantity);
+        self::assertSame(['fs' => '5', 'res' => '0', 'sd' => '0'], $this->quantitiesByState($this->store()->inventoryBalances($intact)));
+        self::assertSame(['fs' => '1', 'res' => '0', 'sd' => '0'], $this->quantitiesByState($this->store()->inventoryBalances($drained)));
         self::assertSame(0, $this->fetchCount('SELECT COUNT(*) FROM invflux_inventory_ledger'));
     }
 
@@ -3747,6 +3853,25 @@ final class MysqlInventoryStoreTest extends TestCase
     private function pdo(): \PDO
     {
         return $this->pdo ?? throw new \LogicException('PDO was not initialized.');
+    }
+
+    /** A new connection to the test database: the suite's own, or a rival transaction's. */
+    private function connect(): \PDO
+    {
+        return new \PDO(
+            sprintf(
+                'mysql:host=%s;port=%s;dbname=%s;charset=utf8mb4',
+                $this->env('INVFLOW_DB_HOST', '127.0.0.1'),
+                $this->env('INVFLOW_DB_PORT', '33067'),
+                $this->env('INVFLOW_DB_NAME', 'invflux_test'),
+            ),
+            $this->env('INVFLOW_DB_USER', 'invflux'),
+            $this->env('INVFLOW_DB_PASS', 'invflux'),
+            [
+                \PDO::ATTR_ERRMODE            => \PDO::ERRMODE_EXCEPTION,
+                \PDO::ATTR_DEFAULT_FETCH_MODE => \PDO::FETCH_ASSOC,
+            ],
+        );
     }
 
     /**

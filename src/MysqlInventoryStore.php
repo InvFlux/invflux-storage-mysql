@@ -262,6 +262,13 @@ final class MysqlInventoryStore implements InventoryStore
     private const INTERNAL_MOVEMENT_OWNER = 'InvFlux';
     private const INTERNAL_MOVEMENT_DRAIN_VALUE = 'VALMIG';
     private const TEMP_TABLE_DELTAS = 'tmp_invflux_deltas';
+
+    /**
+     * How many times a batch flow is planned before a conflict is returned to the caller. Each
+     * further attempt needs another connection to have drained the same slots again in the moment
+     * between a fresh read and its locks.
+     */
+    private const STALE_PLAN_ATTEMPTS = 3;
     private const TABLE_DIMENSIONS = 'invflux_dimensions';
     private const TABLE_DIMENSION_VALUES = 'invflux_dimension_values';
 
@@ -3337,6 +3344,46 @@ final class MysqlInventoryStore implements InventoryStore
             );
         }
 
+        // The plan is made from an unlocked read, so it can be stale by the time persistBatch() takes
+        // its locks: another connection may have drained a source slot in between. This request
+        // arms no guards, so every conflict persistBatch() reports is exactly that, and nothing was
+        // written; planning again from a fresh read gives the outcome the movement would have had if
+        // it had run second. Locking before planning would close the window outright, at the cost of
+        // an extra locking read on every movement, uncontended ones included. One case the retry
+        // cannot help: inside a caller's REPEATABLE READ transaction the read sees that
+        // transaction's snapshot, plans the same movement again, and the conflict is returned.
+        $attempts = 0;
+        do {
+            $persisted = $this->planAndPersistBatchFlow($request, $schema, $space, $flow, $selectedSubjectIds, $layerId);
+        } while (!$persisted->ok && ++$attempts < self::STALE_PLAN_ATTEMPTS);
+
+        // Decorate the persistence result with the unmanaged-subject skip list.
+        // persistBatch() doesn't know about that — it's a pre-engine concern —
+        // so we recompose the final result here.
+        return new PersistedBatchMovement(
+            ok: $persisted->ok,
+            affectedSubjects: $persisted->affectedSubjects,
+            affectedSlots: $persisted->affectedSlots,
+            insertedLedgerRows: $persisted->insertedLedgerRows,
+            recordedAt: $persisted->recordedAt,
+            conflicts: $persisted->conflicts,
+            skippedUnmanagedSubjectIds: $skippedUnmanagedSubjectIds,
+        );
+    }
+
+    /**
+     * Read the selected subjects' current state, plan the flow over it, and persist the plan.
+     *
+     * @param list<SubjectId> $selectedSubjectIds
+     */
+    private function planAndPersistBatchFlow(
+        StorageBatchFlowRequest $request,
+        SlotSpaceDefinition $schema,
+        SlotSpace $space,
+        Flow $flow,
+        array $selectedSubjectIds,
+        ?int $layerId,
+    ): PersistedBatchMovement {
         $inventoryRows = $this->loadInventoryRowsForSubjects($schema, $selectedSubjectIds, $layerId);
         $effectiveSlotFilters = $request->slotFilters ?? [];
 
@@ -3385,7 +3432,7 @@ final class MysqlInventoryStore implements InventoryStore
             params: $request->params,
         );
 
-        $persisted = $this->persistBatch(new PersistBatchMovement(
+        return $this->persistBatch(new PersistBatchMovement(
             movementBatch: $executedBatch,
             subjectIdResolver: static fn (SubjectId $subjectId): SubjectId => $subjectId,
             movementTypeOwnerKey: $request->movementTypeOwnerKey,
@@ -3395,19 +3442,6 @@ final class MysqlInventoryStore implements InventoryStore
             surface: $request->surface,
             recordedAt: $request->recordedAt(),
         ));
-
-        // Decorate the persistence result with the unmanaged-subject skip list.
-        // persistBatch() doesn't know about that — it's a pre-engine concern —
-        // so we recompose the final result here.
-        return new PersistedBatchMovement(
-            ok: $persisted->ok,
-            affectedSubjects: $persisted->affectedSubjects,
-            affectedSlots: $persisted->affectedSlots,
-            insertedLedgerRows: $persisted->insertedLedgerRows,
-            recordedAt: $persisted->recordedAt,
-            conflicts: $persisted->conflicts,
-            skippedUnmanagedSubjectIds: $skippedUnmanagedSubjectIds,
-        );
     }
 
     /**
@@ -4809,6 +4843,13 @@ final class MysqlInventoryStore implements InventoryStore
     /**
      * Detect guard conflicts in the staged and locked inventory rows.
      *
+     * A decremented row carries a floor of 0 even when the movement armed no guard. Quantities are
+     * unsigned, so a delta that would take a row below zero cannot be written at all; it means the
+     * movement was planned from a balance that has since moved — another connection drained the
+     * slot between the planning read and these locks. Caught here it is a `min_quantity` conflict,
+     * which writes nothing and reports `ok: false`, rather than a SQL out-of-range error from the
+     * UPDATE that would follow.
+     *
      * @param list<LockedPersistDeltaRow> $lockedRows
      *
      * @return list<PersistenceConflict>
@@ -4820,8 +4861,9 @@ final class MysqlInventoryStore implements InventoryStore
             $currentQuantity = $row->quantity;
             $delta = $row->delta;
             $projectedQuantity = $row->projectedQuantity();
+            $floor = max(0, $row->minQuantity ?? 0);
 
-            if ($delta < 0 && null !== $row->minQuantity && $projectedQuantity < $row->minQuantity) {
+            if ($delta < 0 && $projectedQuantity < $floor) {
                 $conflicts[] = new PersistenceConflict(
                     new SubjectId($row->subjectId),
                     $row->slotKey,
@@ -4829,7 +4871,7 @@ final class MysqlInventoryStore implements InventoryStore
                     (string) $currentQuantity,
                     (string) $delta,
                     (string) $projectedQuantity,
-                    (string) $row->minQuantity,
+                    (string) $floor,
                     null,
                 );
             }
