@@ -6541,6 +6541,89 @@ final class MysqlInventoryStore implements InventoryStore
         });
     }
 
+    /**
+     * One read to name what is about to be expired, then one write over exactly those rows. The
+     * write repeats the open-ended guard, so a row another writer expired in between is left with
+     * its own end date.
+     */
+    #[\Override]
+    public function expireSubjectIdentifiers(
+        SubjectId $subjectId,
+        array $exceptTypeCodes = [],
+        ?\DateTimeImmutable $validTo = null,
+    ): array {
+        return $this->session->transactional(function () use ($subjectId, $exceptTypeCodes, $validTo): array {
+            $validTo ??= new \DateTimeImmutable();
+
+            $params = ['subject_id' => $subjectId->id, 'open_ended_floor' => IdentifierValidity::OPEN_ENDED_FLOOR];
+            $exceptFilter = '';
+            if ([] !== $exceptTypeCodes) {
+                $placeholders = [];
+                foreach ($exceptTypeCodes as $i => $code) {
+                    $placeholders[] = ':except_'.$i;
+                    $params['except_'.$i] = $code;
+                }
+                $exceptFilter = sprintf('AND it.code NOT IN (%s)', implode(', ', $placeholders));
+            }
+
+            $rows = $this->fetchAllRows(
+                sprintf(
+                    'SELECT si.id, si.subject_id, s.slug AS system_slug, it.code AS type_code,
+                            si.value, si.is_primary, si.scope_actor_id, si.valid_from, si.valid_to,
+                            at.code AS scope_actor_type, a.actor_ref AS scope_actor_ref
+                     FROM %s si
+                     JOIN %s it ON it.id = si.type_id
+                     JOIN %s s  ON s.id  = si.system_id
+                     LEFT JOIN %s a  ON a.id = si.scope_actor_id
+                     LEFT JOIN %s at ON at.id = a.actor_type_id
+                     WHERE si.subject_id = :subject_id
+                       AND si.valid_to >= :open_ended_floor
+                       %s
+                     ORDER BY si.id',
+                    $this->table(self::TABLE_SUBJECT_IDENTIFIERS),
+                    $this->table(self::TABLE_IDENTIFIER_TYPES),
+                    $this->table(self::TABLE_SYSTEMS),
+                    $this->table(self::TABLE_ACTORS),
+                    $this->table(self::TABLE_ACTOR_TYPES),
+                    $exceptFilter,
+                ),
+                $params,
+            );
+
+            if ([] === $rows) {
+                return [];
+            }
+
+            $ids = array_map(static fn (array $row): int => (int) $row['id'], $rows);
+            SubjectIdentifier::updateWhere(
+                ['valid_to' => $validTo],
+                sprintf('id IN (%s) AND valid_to >= ?', implode(', ', array_fill(0, \count($ids), '?'))),
+                [...$ids, IdentifierValidity::OPEN_ENDED_FLOOR],
+            );
+
+            return array_map($this->assignmentFromRow(...), $rows);
+        });
+    }
+
+    #[\Override]
+    public function withdrawIdentifier(
+        SubjectId $subjectId,
+        string $typeCode,
+        string $systemSlug,
+        string $value,
+        ?ActorReference $scopeActor = null,
+    ): int {
+        return $this->session->transactional(function () use ($subjectId, $typeCode, $systemSlug, $value, $scopeActor): int {
+            [$typeId, $systemId, $scopeActorId] = $this->resolveIdentifierLookups($typeCode, $systemSlug, $scopeActor);
+
+            // The active row only: the subject's history of the value, and every other subject's, stay.
+            return SubjectIdentifier::deleteWhere(
+                'subject_id = ? AND system_id = ? AND type_id = ? AND scope_actor_key = ? AND value = ? AND valid_to >= ?',
+                [$subjectId->id, $systemId, $typeId, $scopeActorId ?? 0, $value, IdentifierValidity::OPEN_ENDED_FLOOR],
+            );
+        });
+    }
+
     #[\Override]
     public function replaceSubjectIdentifier(
         SubjectId $subjectId,
@@ -6851,23 +6934,27 @@ final class MysqlInventoryStore implements InventoryStore
             ], static fn ($v): bool => null !== $v),
         );
 
-        return array_map(function (array $row): SubjectIdentifierAssignment {
-            $scopeActor = null;
-            if (null !== $row['scope_actor_type'] && null !== $row['scope_actor_ref']) {
-                $scopeActor = new ActorReference((string) $row['scope_actor_type'], (string) $row['scope_actor_ref']);
-            }
+        return array_map($this->assignmentFromRow(...), $rows);
+    }
 
-            return new SubjectIdentifierAssignment(
-                subjectId: new SubjectId((int) $row['subject_id']),
-                systemSlug: (string) $row['system_slug'],
-                typeCode: (string) $row['type_code'],
-                value: (string) $row['value'],
-                scopeActor: $scopeActor,
-                isPrimary: 1 === (int) ($row['is_primary'] ?? 0),
-                validFrom: new \DateTimeImmutable((string) $row['valid_from']),
-                validTo: new \DateTimeImmutable((string) $row['valid_to']),
-            );
-        }, $rows);
+    /** @param array<string, scalar|null> $row a subject-identifier row joined to its type, system and scope actor */
+    private function assignmentFromRow(array $row): SubjectIdentifierAssignment
+    {
+        $scopeActor = null;
+        if (null !== $row['scope_actor_type'] && null !== $row['scope_actor_ref']) {
+            $scopeActor = new ActorReference((string) $row['scope_actor_type'], (string) $row['scope_actor_ref']);
+        }
+
+        return new SubjectIdentifierAssignment(
+            subjectId: new SubjectId((int) $row['subject_id']),
+            systemSlug: (string) $row['system_slug'],
+            typeCode: (string) $row['type_code'],
+            value: (string) $row['value'],
+            scopeActor: $scopeActor,
+            isPrimary: 1 === (int) ($row['is_primary'] ?? 0),
+            validFrom: new \DateTimeImmutable((string) $row['valid_from']),
+            validTo: new \DateTimeImmutable((string) $row['valid_to']),
+        );
     }
 
     /**

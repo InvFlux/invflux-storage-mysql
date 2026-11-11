@@ -2452,6 +2452,118 @@ final class MysqlInventoryStoreTest extends TestCase
         self::assertNull($this->store()->resolveIdentifier('sku', 'woo', 'SKU-GONE'));
     }
 
+    /**
+     * A withdrawn assignment leaves nothing behind: where an expired one still answers for the time
+     * it was valid, a withdrawn one answers for no time at all.
+     */
+    public function testWithdrawIdentifierLeavesNoHistory(): void
+    {
+        $this->store()->bootstrap($this->baseDefinition());
+        $this->store()->registerSystem('woo', 'WooCommerce');
+        $this->store()->registerIdentifierType('extra_gtin', 'Extra GTIN', 'barcode');
+
+        $subject = $this->store()->registerSubject();
+        $this->store()->claimIdentifier($subject, 'extra_gtin', 'woo', '4006381333931', validFrom: new \DateTimeImmutable('2020-01-01'));
+
+        self::assertSame(1, $this->store()->withdrawIdentifier($subject, 'extra_gtin', 'woo', '4006381333931'));
+        self::assertNull($this->store()->resolveIdentifier('extra_gtin', 'woo', '4006381333931'));
+        self::assertNull($this->store()->resolveIdentifier('extra_gtin', 'woo', '4006381333931', asOf: new \DateTimeImmutable('2020-06-01')));
+        self::assertSame(0, $this->store()->withdrawIdentifier($subject, 'extra_gtin', 'woo', '4006381333931'), 'nothing left to withdraw');
+    }
+
+    /** Only the named subject's active row goes: another subject holding the value keeps it. */
+    public function testWithdrawIdentifierTouchesOnlyTheNamedSubject(): void
+    {
+        $this->store()->bootstrap($this->baseDefinition());
+        $this->store()->registerSystem('woo', 'WooCommerce');
+        $this->store()->registerIdentifierType('extra_gtin', 'Extra GTIN', 'barcode');
+
+        $holder = $this->store()->registerSubject();
+        $other = $this->store()->registerSubject();
+        $this->store()->claimIdentifier($holder, 'extra_gtin', 'woo', 'CODE-1');
+
+        self::assertSame(0, $this->store()->withdrawIdentifier($other, 'extra_gtin', 'woo', 'CODE-1'));
+        self::assertSame($holder->id, $this->store()->resolveIdentifier('extra_gtin', 'woo', 'CODE-1')?->id);
+    }
+
+    /** A scoped value is withdrawn in its own scope only: the same value under another scope stays. */
+    public function testWithdrawIdentifierStaysInItsScope(): void
+    {
+        $this->store()->bootstrap($this->baseDefinition());
+        $this->store()->registerSystem('woo', 'WooCommerce');
+        $this->store()->registerIdentifierType('supplier_barcode', 'Supplier Barcode', 'barcode');
+        $this->store()->registerActorTypes([new ActorTypeDefinition('supplier', 'Supplier')]);
+        $this->store()->resolveActorId('supplier', '1');
+        $this->store()->resolveActorId('supplier', '2');
+
+        $subject = $this->store()->registerSubject();
+        $first = new ActorReference('supplier', '1');
+        $second = new ActorReference('supplier', '2');
+        $this->store()->claimIdentifier($subject, 'supplier_barcode', 'woo', 'LBL-9', $first);
+        $this->store()->claimIdentifier($subject, 'supplier_barcode', 'woo', 'LBL-9', $second);
+
+        self::assertSame(1, $this->store()->withdrawIdentifier($subject, 'supplier_barcode', 'woo', 'LBL-9', $first));
+        self::assertNull($this->store()->resolveIdentifier('supplier_barcode', 'woo', 'LBL-9', $first));
+        self::assertSame($subject->id, $this->store()->resolveIdentifier('supplier_barcode', 'woo', 'LBL-9', $second)?->id);
+    }
+
+    /** The subject's earlier, expired assignment of the same value is history and is kept. */
+    public function testWithdrawIdentifierKeepsAnEarlierExpiredAssignment(): void
+    {
+        $this->store()->bootstrap($this->baseDefinition());
+        $this->store()->registerSystem('woo', 'WooCommerce');
+        $this->store()->registerIdentifierType('extra_gtin', 'Extra GTIN', 'barcode');
+
+        $subject = $this->store()->registerSubject();
+        $this->store()->claimIdentifier($subject, 'extra_gtin', 'woo', 'CODE-2', validFrom: new \DateTimeImmutable('2020-01-01'));
+        $this->store()->expireIdentifier('extra_gtin', 'woo', 'CODE-2', validTo: new \DateTimeImmutable('2021-01-01'));
+        $this->store()->claimIdentifier($subject, 'extra_gtin', 'woo', 'CODE-2');
+
+        self::assertSame(1, $this->store()->withdrawIdentifier($subject, 'extra_gtin', 'woo', 'CODE-2'));
+        self::assertNull($this->store()->resolveIdentifier('extra_gtin', 'woo', 'CODE-2'));
+        self::assertSame($subject->id, $this->store()->resolveIdentifier('extra_gtin', 'woo', 'CODE-2', asOf: new \DateTimeImmutable('2020-06-01'))?->id);
+    }
+
+    /**
+     * One call expires everything the subject holds, across systems and scopes, except the listed
+     * types, and names what it expired. Another subject's identifiers and the subject's own history
+     * are untouched.
+     */
+    public function testExpireSubjectIdentifiersExpiresAllButTheExceptedTypes(): void
+    {
+        $this->store()->bootstrap($this->baseDefinition());
+        $this->store()->registerSystem('woo', 'WooCommerce');
+        $this->store()->registerIdentifierType('woo_post_id', 'WooCommerce Post ID', 'internal');
+        $this->store()->registerIdentifierType('extra_gtin', 'Extra GTIN', 'barcode');
+        $this->store()->registerIdentifierType('supplier_barcode', 'Supplier Barcode', 'barcode');
+        $this->store()->registerActorTypes([new ActorTypeDefinition('supplier', 'Supplier')]);
+        $this->store()->resolveActorId('supplier', '1');
+        $supplier = new ActorReference('supplier', '1');
+
+        $subject = $this->store()->registerSubject();
+        $other = $this->store()->registerSubject();
+        $this->store()->claimIdentifier($subject, 'woo_post_id', 'woo', '101', isPrimary: true);
+        $this->store()->claimIdentifier($subject, 'extra_gtin', 'woo', 'OLD', validFrom: new \DateTimeImmutable('2020-01-01'));
+        $this->store()->expireIdentifier('extra_gtin', 'woo', 'OLD', validTo: new \DateTimeImmutable('2021-01-01'));
+        $this->store()->claimIdentifier($subject, 'extra_gtin', 'woo', 'GTIN-1');
+        $this->store()->claimIdentifier($subject, 'supplier_barcode', 'woo', 'LBL-1', $supplier);
+        $this->store()->claimIdentifier($other, 'extra_gtin', 'woo', 'GTIN-2');
+        $at = new \DateTimeImmutable('2030-01-01 00:00:00');
+
+        $expired = $this->store()->expireSubjectIdentifiers($subject, ['woo_post_id'], $at);
+
+        $named = array_map(static fn ($a): string => $a->typeCode.'='.$a->value.(null !== $a->scopeActor ? '@'.($a->scopeActor->actorId ?? '') : ''), $expired);
+        sort($named);
+        self::assertSame(['extra_gtin=GTIN-1', 'supplier_barcode=LBL-1@1'], $named);
+        self::assertNull($this->store()->resolveIdentifier('extra_gtin', 'woo', 'GTIN-1', asOf: $at));
+        self::assertNull($this->store()->resolveIdentifier('supplier_barcode', 'woo', 'LBL-1', $supplier, asOf: $at));
+        self::assertSame($subject->id, $this->store()->resolveIdentifier('extra_gtin', 'woo', 'GTIN-1', asOf: new \DateTimeImmutable('2029-12-31'))?->id, 'expired at the given time, not before');
+        self::assertSame($subject->id, $this->store()->resolveIdentifier('woo_post_id', 'woo', '101', asOf: $at)?->id, 'an excepted type stays active');
+        self::assertSame($other->id, $this->store()->resolveIdentifier('extra_gtin', 'woo', 'GTIN-2', asOf: $at)?->id);
+        self::assertSame($subject->id, $this->store()->resolveIdentifier('extra_gtin', 'woo', 'OLD', asOf: new \DateTimeImmutable('2020-06-01'))?->id, 'history keeps its own end date');
+        self::assertSame([], $this->store()->expireSubjectIdentifiers($subject, ['woo_post_id'], $at), 'nothing left to expire');
+    }
+
     public function testResolveExpiredIdentifierSubjectPicksTheMostRecentPriorOfTheRequestedKind(): void
     {
         $this->store()->bootstrap($this->baseDefinition());

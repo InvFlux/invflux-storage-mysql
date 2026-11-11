@@ -7,7 +7,10 @@ namespace Nandan108\InvFlux\Storage\Mysql;
 use Nandan108\Attrecord\Connection;
 use Nandan108\Attrecord\DbSession;
 use Nandan108\Attrecord\Enum\OnConflict;
+use Nandan108\Attrecord\Exception\OptimisticLockException;
+use Nandan108\Attrecord\Exception\RecordSaveException;
 use Nandan108\Attrecord\LockSet;
+use Nandan108\Attrecord\RawSql;
 use Nandan108\Attrecord\Record;
 use Nandan108\Attrecord\RecordSet;
 use Nandan108\Attrecord\WhereClause;
@@ -28,6 +31,7 @@ use Nandan108\InvFlux\Domain\Procurement\ReceiptCorrection;
 use Nandan108\InvFlux\Domain\Procurement\ReceiptCorrectionLine;
 use Nandan108\InvFlux\Domain\Procurement\ReceiptLine;
 use Nandan108\InvFlux\Domain\Procurement\ReceivingSession;
+use Nandan108\InvFlux\Domain\Procurement\ReceivingSessionLine;
 use Nandan108\InvFlux\Domain\Procurement\ReceivingSessionRepository;
 use Nandan108\InvFlux\Domain\Procurement\SubjectCost;
 use Nandan108\InvFlux\Domain\Procurement\Supplier;
@@ -43,6 +47,8 @@ use Nandan108\InvFlux\Domain\Procurement\TermsVersion;
 use Nandan108\InvFlux\Domain\Stock\AdjustmentReason;
 use Nandan108\InvFlux\Domain\Subject\SubjectId;
 use Nandan108\InvFlux\Domain\Subject\SubjectStockConcern;
+use Nandan108\InvFlux\Exceptions\DuplicateSupplierInvoiceException;
+use Nandan108\InvFlux\Exceptions\StaleReceivingLineException;
 use Nandan108\InvFlux\Identity\ActorRecord;
 use Nandan108\InvFlux\Identity\ActorTypeRecord;
 use Nandan108\InvFlux\Identity\IdentifierTypeRecord;
@@ -139,6 +145,8 @@ final class MysqlDomainStore implements SupplierRepository, PurchaseOrderReposit
         // Reception WIP. No foreign key of its own — it names its target document by the same
         // discriminated ref a receipt does, so it installs independently of what it points at.
         ReceivingSession::class,
+        // A count's lines FK into their session and go with it.
+        ReceivingSessionLine::class,
         // Supplier invoices FK into the order, and their lines into the ordered lines, so both
         // follow the pair they reference.
         SupplierInvoice::class,
@@ -1381,12 +1389,8 @@ final class MysqlDomainStore implements SupplierRepository, PurchaseOrderReposit
     }
 
     /**
-     * The invoice, its lines and the write-back onto the ordered lines, in one transaction.
-     *
-     * The ordered lines arrive already carrying their new `qty_invoiced` / `unit_cost_invoiced` —
-     * the caller computed them, because the two are maintained differently and only it knows the
-     * prior documents. This method's job is that the document and the write-back land together, so
-     * the order can never end up quoting a rate no invoice supports.
+     * The invoice, its lines and the write-back onto the ordered lines, in one transaction, under the
+     * order's lock (see {@see lockOrderForInvoiceNumber()}).
      *
      * @param list<SupplierInvoiceLine> $lines
      * @param list<PurchaseOrderLine>   $touchedOrderLines
@@ -1398,22 +1402,114 @@ final class MysqlDomainStore implements SupplierRepository, PurchaseOrderReposit
         array $touchedOrderLines,
     ): SupplierInvoice {
         return $this->transactional(function () use ($invoice, $lines, $touchedOrderLines): SupplierInvoice {
+            $this->lockOrderForInvoiceNumber($invoice);
             $invoice->save();
-            $invoiceId = (int) $invoice->id;
-
-            foreach ($lines as $line) {
-                $line->invoice_id = $invoiceId;
-            }
-            (new RecordSet($lines))->upsertAll();
-
-            // The caller handed these back already mutated, so this is a bulk write and not a
-            // read-modify-write: locking them again to re-read would discard what it computed.
-            if ([] !== $touchedOrderLines) {
-                (new RecordSet($touchedOrderLines))->upsertAll();
-            }
+            $this->writeInvoiceLines($invoice, $lines, $touchedOrderLines);
 
             return $invoice;
         });
+    }
+
+    /**
+     * @param list<SupplierInvoiceLine> $lines
+     * @param list<PurchaseOrderLine>   $touchedOrderLines
+     */
+    #[\Override]
+    public function replaceSupplierInvoice(
+        SupplierInvoice $invoice,
+        array $lines,
+        array $touchedOrderLines,
+    ): SupplierInvoice {
+        return $this->transactional(function () use ($invoice, $lines, $touchedOrderLines): SupplierInvoice {
+            $this->lockOrderForInvoiceNumber($invoice);
+            $invoice->save();
+            // The document is replaced as a whole: its previous lines go, the ones it now states come in.
+            SupplierInvoiceLine::deleteWhere('invoice_id = ?', [(int) $invoice->id]);
+            foreach ($lines as $line) {
+                $line->id = null;
+            }
+            $this->writeInvoiceLines($invoice, $lines, $touchedOrderLines);
+
+            return $invoice;
+        });
+    }
+
+    /**
+     * @param list<PurchaseOrderLine> $touchedOrderLines
+     */
+    #[\Override]
+    public function deleteSupplierInvoice(SupplierInvoice $invoice, array $touchedOrderLines): void
+    {
+        $this->transactional(function () use ($invoice, $touchedOrderLines): void {
+            $this->lockOrderForInvoiceNumber(null, $invoice->po_id);
+            // Removed explicitly rather than left to the foreign key's cascade, so the lines go the
+            // same way on every database this store runs on.
+            SupplierInvoiceLine::deleteWhere('invoice_id = ?', [(int) $invoice->id]);
+            $invoice->delete();
+            if ([] !== $touchedOrderLines) {
+                (new RecordSet($touchedOrderLines))->upsertAll();
+            }
+        });
+    }
+
+    #[\Override]
+    public function findSupplierInvoice(int $id): ?SupplierInvoice
+    {
+        return SupplierInvoice::findOne('id = ?', [$id]);
+    }
+
+    /**
+     * Lock the order an invoice bills, then refuse a number another of its invoices already has.
+     *
+     * The order row is the lock because it is what two saves of one number share before either
+     * exists; checking without it would let two simultaneous saves both see no duplicate. Compared
+     * the way the operator reads them: case-insensitive, surrounding spaces ignored.
+     *
+     * @throws DuplicateSupplierInvoiceException
+     */
+    private function lockOrderForInvoiceNumber(?SupplierInvoice $invoice, ?int $poId = null): void
+    {
+        $poId ??= (int) $invoice?->po_id;
+        $connection = null !== $this->session
+            ? new Connection($this->session, $this->connection->dialect)
+            : $this->connection;
+        LockSet::acquire($connection, [PurchaseOrder::class => [$poId]]);
+        if (null === $invoice) {
+            return;
+        }
+
+        $wanted = DuplicateSupplierInvoiceException::normalize($invoice->reference);
+        foreach (SupplierInvoice::find('po_id = ?', [$poId]) as $other) {
+            if ($other->id !== $invoice->id && DuplicateSupplierInvoiceException::normalize($other->reference) === $wanted) {
+                throw new DuplicateSupplierInvoiceException($invoice->reference, (int) $other->id);
+            }
+        }
+    }
+
+    /**
+     * Save an invoice's lines under it, and the ordered lines' write-back with them.
+     *
+     * The ordered lines arrive already carrying their new `qty_invoiced` / `unit_cost_invoiced` — the
+     * caller computed them, because the two are maintained differently and only it knows the prior
+     * documents. Landing them in the invoice's transaction is what keeps the order from ever quoting
+     * a rate no invoice supports.
+     *
+     * @param list<SupplierInvoiceLine> $lines
+     * @param list<PurchaseOrderLine>   $touchedOrderLines
+     */
+    private function writeInvoiceLines(SupplierInvoice $invoice, array $lines, array $touchedOrderLines): void
+    {
+        $invoiceId = (int) $invoice->id;
+        foreach ($lines as $line) {
+            $line->invoice_id = $invoiceId;
+        }
+        (new RecordSet($lines))->upsertAll();
+
+        // The caller handed these back already mutated, so this is a bulk write and not a
+        // read-modify-write: locking them again to re-read would discard what it computed.
+        if ([] !== $touchedOrderLines) {
+            (new RecordSet($touchedOrderLines))->upsertAll();
+        }
     }
 
     /**
@@ -1747,6 +1843,145 @@ final class MysqlDomainStore implements SupplierRepository, PurchaseOrderReposit
     public function deleteReceivingSession(int $id): void
     {
         ReceivingSession::getOne($id)?->delete();
+    }
+
+    /**
+     * A first write (no row expected) is a plain insert, with no read before it: the key is the whole
+     * check, so a row another writer created — a moment ago or in the same instant — collides on it and
+     * is refused as stale, carrying that row.
+     *
+     * A later write is load-compare-save: the row is read, its version checked against the one the
+     * writer saw, and the save guarded by attrecord's own version predicate, so a write that lands
+     * between the read and the save is refused too.
+     */
+    #[\Override]
+    public function stageReceivingLine(ReceivingSessionLine $line, ?int $expectedVersion): ReceivingSessionLine
+    {
+        $key = ['session_id' => $line->session_id, 'subject_id' => $line->subject_id];
+        $stale = fn (): StaleReceivingLineException => new StaleReceivingLineException(
+            $line->session_id,
+            $line->subject_id,
+            ReceivingSessionLine::getOne($key),
+        );
+
+        if (null === $expectedVersion) {
+            try {
+                $line->save();
+            } catch (RecordSaveException $e) {
+                if (null !== ReceivingSessionLine::getOne($key)) {
+                    throw $stale();
+                }
+                throw $e;
+            }
+
+            return $line;
+        }
+
+        $current = ReceivingSessionLine::getOne($key);
+        if (null === $current || $current->version !== $expectedVersion) {
+            throw $stale();
+        }
+        $current->qty_received = $line->qty_received;
+        $current->qty_damaged = $line->qty_damaged;
+        $current->unit_cost = $line->unit_cost;
+        $current->supplier_price = $line->supplier_price;
+        $current->updated_by = $line->updated_by;
+        try {
+            $current->save();
+        } catch (OptimisticLockException) {
+            throw $stale();
+        }
+
+        return $current;
+    }
+
+    /**
+     * One single-table `UPDATE … SET qty_received = COALESCE(qty_received, 0) + ?`, which attrecord
+     * also has bump the version. No row yet: insert one holding the units; if a coworker's insert
+     * won that race the key collides, and the update — now finding their row — is run again.
+     */
+    #[\Override]
+    public function addToReceivingLine(int $sessionId, int $subjectId, int $add, ?int $userId): ReceivingSessionLine
+    {
+        if ($add < 1) {
+            throw new \InvalidArgumentException('An increment adds at least one unit.');
+        }
+        $key = ['session_id' => $sessionId, 'subject_id' => $subjectId];
+        $increment = static fn (): int => ReceivingSessionLine::updateWhere(
+            [
+                'qty_received' => new RawSql('COALESCE(`qty_received`, 0) + ?', [$add]),
+                'updated_at'   => new \DateTimeImmutable(),
+                'updated_by'   => $userId,
+            ],
+            'session_id = ? AND subject_id = ?',
+            [$sessionId, $subjectId],
+        );
+
+        if (0 === $increment()) {
+            try {
+                ReceivingSessionLine::newWith($key + ['qty_received' => $add, 'updated_by' => $userId])->save();
+            } catch (RecordSaveException $e) {
+                if (0 === $increment()) {
+                    throw $e;
+                }
+            }
+        }
+
+        return ReceivingSessionLine::getOne($key)
+            ?? throw new \LogicException('The line just written could not be read back.');
+    }
+
+    /**
+     * @return list<ReceivingSessionLine>
+     */
+    #[\Override]
+    public function receivingSessionLines(int $sessionId): array
+    {
+        return [...ReceivingSessionLine::find('session_id = ?', [$sessionId], 'ORDER BY subject_id')];
+    }
+
+    /**
+     * @return list<ReceivingSessionLine>
+     */
+    #[\Override]
+    public function receivingSessionLinesChangedSince(int $sessionId, \DateTimeImmutable $since): array
+    {
+        // Served by idx_session_updated (session_id, updated_at).
+        return [...ReceivingSessionLine::find(
+            'session_id = ? AND updated_at >= ?',
+            [$sessionId, $since->format('Y-m-d H:i:s.u')],
+            'ORDER BY subject_id',
+        )];
+    }
+
+    /**
+     * @param list<int> $sessionIds
+     *
+     * @return array<int, int>
+     */
+    #[\Override]
+    public function countedLinesForSessions(array $sessionIds): array
+    {
+        if ([] === $sessionIds) {
+            return [];
+        }
+        $session = $this->session ?? $this->connection->session;
+        $placeholders = implode(',', array_fill(0, count($sessionIds), '?'));
+        $rows = $session->fetchAll(
+            sprintf(
+                'SELECT session_id, COUNT(*) AS n FROM `%s` WHERE session_id IN (%s) AND qty_received IS NOT NULL GROUP BY session_id',
+                $this->table('invflux_receiving_session_lines'),
+                $placeholders,
+            ),
+            $sessionIds,
+        );
+
+        $counts = [];
+        foreach ($rows as $row) {
+            $counts[(int) $row['session_id']] = (int) $row['n'];
+        }
+
+        return $counts;
     }
 
     #[\Override]
