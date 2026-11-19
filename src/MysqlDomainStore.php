@@ -15,6 +15,8 @@ use Nandan108\Attrecord\Record;
 use Nandan108\Attrecord\RecordSet;
 use Nandan108\Attrecord\WhereClause;
 use Nandan108\InvFlux\Domain\Label\LabelTranslation;
+use Nandan108\InvFlux\Domain\Location\Location;
+use Nandan108\InvFlux\Domain\Location\SubjectLocation;
 use Nandan108\InvFlux\Domain\Procurement\DocumentParty;
 use Nandan108\InvFlux\Domain\Procurement\DocumentPartyDecision;
 use Nandan108\InvFlux\Domain\Procurement\GoodsReceipt;
@@ -165,7 +167,8 @@ final class MysqlDomainStore implements SupplierRepository, PurchaseOrderReposit
     /**
      * Domain Records that belong to neither registry above: the subject worksheets (a saved
      * selection of subjects plus its items), the per-subject stock-concern projection that backs
-     * the workbench's stock-state badge, and the merchant's own label translations.
+     * the workbench's stock-state badge, the merchant's own label translations, and the store's
+     * locations with the products kept at them.
      *
      * @var list<class-string<Record>>
      */
@@ -177,6 +180,10 @@ final class MysqlDomainStore implements SupplierRepository, PurchaseOrderReposit
         // (tags today, locations and reason codes next). Polymorphic by `entity_key` and so
         // without a foreign key, like Annotation — position is free.
         LabelTranslation::class,
+        // Where products are usually kept: the merchant's location tree, and each subject's ranked
+        // links into it. Not `loc` values — no stock is recorded there. The link FKs into both.
+        Location::class,
+        SubjectLocation::class,
     ];
 
     private bool $referenceTablesInstalled = false;
